@@ -1,0 +1,4 @@
+[submodule "turbo-proto/interfaces"]
+	path = turbo-proto/interfaces
+	url = https://github.com/ledgerwatch/interfaces
+	branch = master
