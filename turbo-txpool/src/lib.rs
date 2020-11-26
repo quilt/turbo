@@ -6,7 +6,7 @@ use tonic::{Request, Response, Status};
 use turbo_proto::tonic;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
-    GetTransactionsReply, GetTransactionsRequest, InjectReply, InjectRequest,
+    GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
     TxHashes,
 };
 
@@ -20,10 +20,10 @@ impl TxPool {
         todo!()
     }
 
-    pub async fn inject_transactions(
+    pub async fn import_transactions(
         &self,
-        request: Request<InjectRequest>,
-    ) -> Result<Response<InjectReply>, Status> {
+        request: Request<ImportRequest>,
+    ) -> Result<Response<ImportReply>, Status> {
         todo!()
     }
 
@@ -53,12 +53,12 @@ impl server::Txpool for TxPool {
         Box::pin(self.find_unknown_transactions(request))
     }
 
-    fn inject_transactions<'a, 'async_trait>(
+    fn import_transactions<'a, 'async_trait>(
         &'a self,
-        request: Request<InjectRequest>,
+        request: Request<ImportRequest>,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Response<InjectReply>, Status>>
+            dyn Future<Output = Result<Response<ImportReply>, Status>>
                 + Send
                 + 'async_trait,
         >,
@@ -67,7 +67,7 @@ impl server::Txpool for TxPool {
         'a: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(self.inject_transactions(request))
+        Box::pin(self.import_transactions(request))
     }
 
     fn get_transactions<'a, 'async_trait>(
