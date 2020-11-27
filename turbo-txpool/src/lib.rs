@@ -15,21 +15,21 @@ pub struct TxPool {}
 impl TxPool {
     pub async fn find_unknown_transactions(
         &self,
-        request: Request<TxHashes>,
+        _request: Request<TxHashes>,
     ) -> Result<Response<TxHashes>, Status> {
         todo!()
     }
 
     pub async fn import_transactions(
         &self,
-        request: Request<ImportRequest>,
+        _request: Request<ImportRequest>,
     ) -> Result<Response<ImportReply>, Status> {
         todo!()
     }
 
     pub async fn get_transactions(
         &self,
-        request: Request<GetTransactionsRequest>,
+        _request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsReply>, Status> {
         todo!()
     }

@@ -36,8 +36,8 @@ mod cmd {
     where
         T: FromHex,
     {
-        if txt.starts_with("0x") {
-            T::from_hex(&txt[2..]).map_err(HexError::FromHex)
+        if let Some(stripped) = txt.strip_prefix("0x") {
+            T::from_hex(stripped).map_err(HexError::FromHex)
         } else {
             Err(HexError::NotHex)
         }

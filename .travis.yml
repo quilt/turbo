@@ -1,0 +1,22 @@
+os:
+    - linux
+    - windows
+language: rust
+rust:
+    - 1.45.0
+    - stable
+    - nightly
+dist: bionic
+before_install:
+  - rustup component add clippy
+  - rustup component add rustfmt
+jobs:
+    allow_failures:
+        - rust: nightly
+    fast_finish: true
+script:
+    - cargo fmt --all -- --check
+    - cargo clippy --all -- -D warnings
+    - cargo test --all
+cache:
+    cargo: true
