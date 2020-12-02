@@ -1,5 +1,18 @@
+pub mod error;
+mod tx;
+
+use crate::error::Error;
+use crate::tx::{Priced, Tx};
+
+use ethereum_types::H256;
+
+use slab::Slab;
+
+use std::collections::{hash_map, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+
+use tokio::sync::RwLock;
 
 use tonic::{Request, Response, Status};
 
@@ -7,31 +20,160 @@ use turbo_proto::tonic;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
     GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
-    TxHashes,
+    ImportResult, TxHashes,
 };
 
-pub struct TxPool {}
+use typed_builder::TypedBuilder;
 
-impl TxPool {
-    pub async fn find_unknown_transactions(
+#[derive(Debug)]
+struct Inner {
+    txs: Slab<Tx>,
+    by_hash: HashMap<H256, usize>,
+    by_price: BTreeSet<Priced>,
+
+    max_txs: usize,
+}
+
+impl Inner {
+    fn cheapest_key(&self) -> Option<usize> {
+        self.by_price.iter().next().map(|p| p.key)
+    }
+
+    fn cheapest(&self) -> Option<&Tx> {
+        self.cheapest_key().map(|k| &self.txs[k])
+    }
+
+    fn insert(&mut self, tx: Tx) -> ImportResult {
+        if self.txs.len() >= self.max_txs {
+            let cheapest =
+                self.cheapest().map(|t| t.gas_price).unwrap_or_default();
+            if tx.gas_price <= cheapest {
+                return ImportResult::FeeTooLow;
+            }
+        }
+
+        let by_hash = match self.by_hash.entry(tx.hash) {
+            hash_map::Entry::Vacant(v) => v,
+            hash_map::Entry::Occupied(_) => return ImportResult::AlreadyExists,
+        };
+
+        let gas_price = tx.gas_price;
+        let key = self.txs.insert(tx);
+
+        let inserted = self.by_price.insert(Priced { gas_price, key });
+        assert!(inserted);
+
+        by_hash.insert(key);
+
+        while self.txs.len() > self.max_txs {
+            self.remove(self.cheapest_key().unwrap());
+        }
+
+        ImportResult::Success
+    }
+
+    fn remove(&mut self, key: usize) {
+        let tx = self.txs.remove(key);
+        self.by_hash.remove(&tx.hash).expect("desync by hash");
+
+        let removed = self.by_price.remove(&Priced {
+            gas_price: tx.gas_price,
+            key,
+        });
+        assert!(removed, "desync by price");
+    }
+
+    pub fn with_config(config: Config) -> Self {
+        Self {
+            max_txs: config.max_txs,
+            txs: Slab::with_capacity(config.max_txs),
+            by_hash: HashMap::with_capacity(config.max_txs),
+            by_price: BTreeSet::new(),
+        }
+    }
+
+    pub fn find_unknown_transactions(
         &self,
-        _request: Request<TxHashes>,
+        request: Request<TxHashes>,
     ) -> Result<Response<TxHashes>, Status> {
-        todo!()
+        let hashes = request
+            .into_inner()
+            .hashes
+            .into_iter()
+            .filter(|vec| self.by_hash.contains_key(&H256::from_slice(&vec)))
+            .collect();
+
+        Ok(Response::new(TxHashes { hashes }))
     }
 
-    pub async fn import_transactions(
-        &self,
-        _request: Request<ImportRequest>,
+    pub fn import_transactions(
+        &mut self,
+        request: Request<ImportRequest>,
     ) -> Result<Response<ImportReply>, Status> {
-        todo!()
+        let txs: Vec<_> = request
+            .into_inner()
+            .txs
+            .into_iter()
+            .map(|b| Tx::decode(&rlp::Rlp::new(&b)))
+            .collect();
+
+        let mut imported = Vec::with_capacity(txs.len());
+
+        for tx in txs.into_iter() {
+            let result = match tx {
+                Ok(tx) => self.insert(tx),
+                Err(Error::RlpDecode { .. }) => ImportResult::Invalid,
+                Err(Error::IntegerOverflow) => ImportResult::InternalError,
+            };
+            imported.push(result as i32);
+        }
+
+        Ok(Response::new(ImportReply { imported }))
     }
 
-    pub async fn get_transactions(
+    pub fn get_transactions(
         &self,
         _request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsReply>, Status> {
         todo!()
+    }
+}
+
+#[derive(Debug, TypedBuilder)]
+pub struct Config {
+    max_txs: usize,
+}
+
+pub struct TxPool {
+    inner: RwLock<Inner>,
+}
+
+impl TxPool {
+    pub fn with_config(config: Config) -> Self {
+        Self {
+            inner: RwLock::new(Inner::with_config(config)),
+        }
+    }
+
+    pub async fn find_unknown_transactions(
+        &self,
+        request: Request<TxHashes>,
+    ) -> Result<Response<TxHashes>, Status> {
+        self.inner.read().await.find_unknown_transactions(request)
+    }
+
+    pub async fn import_transactions(
+        &self,
+        request: Request<ImportRequest>,
+    ) -> Result<Response<ImportReply>, Status> {
+        self.inner.write().await.import_transactions(request)
+    }
+
+    pub async fn get_transactions(
+        &self,
+        request: Request<GetTransactionsRequest>,
+    ) -> Result<Response<GetTransactionsReply>, Status> {
+        self.inner.read().await.get_transactions(request)
     }
 }
 
@@ -85,5 +227,140 @@ impl server::Txpool for TxPool {
         Self: 'async_trait,
     {
         Box::pin(self.get_transactions(request))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inner() -> Inner {
+        let cfg = Config::builder().max_txs(10).build();
+        Inner::with_config(cfg)
+    }
+
+    fn tx(gas_price: u64) -> Tx {
+        Tx {
+            gas_price: gas_price.into(),
+            gas_limit: Default::default(),
+            hash: H256::from_low_u64_be(gas_price),
+            nonce: Default::default(),
+            to: Default::default(),
+            input: Default::default(),
+            v: Default::default(),
+            r: Default::default(),
+            s: Default::default(),
+            value: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cheapest() {
+        let mut txs = Slab::new();
+        let k0 = txs.insert(tx(100));
+        let k1 = txs.insert(tx(101));
+
+        let mut by_hash = HashMap::new();
+        by_hash.insert(txs[k0].hash, k0);
+        by_hash.insert(txs[k1].hash, k1);
+
+        let mut by_price = BTreeSet::new();
+        by_price.insert(Priced {
+            key: k0,
+            gas_price: txs[k0].gas_price,
+        });
+        by_price.insert(Priced {
+            key: k1,
+            gas_price: txs[k1].gas_price,
+        });
+
+        let inner = Inner {
+            txs,
+            by_hash,
+            by_price,
+            max_txs: 2,
+        };
+
+        assert_eq!(inner.cheapest_key(), Some(k0));
+        assert_eq!(inner.cheapest(), Some(&inner.txs[0]));
+    }
+
+    #[test]
+    fn insert_2() {
+        let mut inner = inner();
+        let tx0 = tx(100);
+        let tx1 = tx(101);
+
+        let result = inner.insert(tx0.clone());
+        assert_eq!(result, ImportResult::Success);
+
+        let result2 = inner.insert(tx1.clone());
+        assert_eq!(result2, ImportResult::Success);
+
+        assert_eq!(inner.txs.len(), 2);
+        assert_eq!(inner.by_hash.len(), 2);
+        assert_eq!(inner.by_price.len(), 2);
+
+        assert_eq!(inner.txs[inner.by_hash[&tx0.hash]], tx0);
+        assert_eq!(inner.txs[inner.by_hash[&tx1.hash]], tx1);
+
+        let mut iter = inner.by_price.iter();
+        let i0 = iter.next().unwrap();
+        let i1 = iter.next().unwrap();
+
+        assert_eq!(inner.txs[i0.key], tx0);
+        assert_eq!(i0.gas_price, tx0.gas_price);
+
+        assert_eq!(inner.txs[i1.key], tx1);
+        assert_eq!(i1.gas_price, tx1.gas_price);
+    }
+
+    #[test]
+    fn insert_fee_too_low() {
+        let mut inner =
+            Inner::with_config(Config::builder().max_txs(1).build());
+
+        let r0 = inner.insert(tx(100));
+        assert_eq!(r0, ImportResult::Success);
+
+        let r1 = inner.insert(tx(99));
+        assert_eq!(r1, ImportResult::FeeTooLow);
+    }
+
+    #[test]
+    fn insert_already_exists() {
+        let mut inner = inner();
+
+        let r0 = inner.insert(tx(100));
+        assert_eq!(r0, ImportResult::Success);
+
+        let r1 = inner.insert(tx(100));
+        assert_eq!(r1, ImportResult::AlreadyExists);
+    }
+
+    #[test]
+    fn insert_evict() {
+        let mut inner =
+            Inner::with_config(Config::builder().max_txs(1).build());
+
+        let tx0 = tx(99);
+        let r0 = inner.insert(tx0.clone());
+        assert_eq!(r0, ImportResult::Success);
+
+        let tx1 = tx(100);
+        let r1 = inner.insert(tx1.clone());
+        assert_eq!(r1, ImportResult::Success);
+
+        assert_eq!(inner.txs.len(), 1);
+        assert_eq!(inner.by_hash.len(), 1);
+        assert_eq!(inner.by_price.len(), 1);
+
+        assert_eq!(inner.txs[inner.by_hash[&tx1.hash]], tx1);
+
+        let mut iter = inner.by_price.iter();
+        let i0 = iter.next().unwrap();
+
+        assert_eq!(inner.txs[i0.key], tx1);
+        assert_eq!(i0.gas_price, tx1.gas_price);
     }
 }
