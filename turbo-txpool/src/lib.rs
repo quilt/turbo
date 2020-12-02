@@ -43,6 +43,10 @@ impl Inner {
         self.cheapest_key().map(|k| &self.txs[k])
     }
 
+    fn by_hash(&self, hash: &H256) -> Option<&Tx> {
+        self.by_hash.get(hash).and_then(|k| self.txs.get(*k))
+    }
+
     fn insert(&mut self, tx: Tx) -> ImportResult {
         if self.txs.len() >= self.max_txs {
             let cheapest =
@@ -133,9 +137,21 @@ impl Inner {
 
     pub fn get_transactions(
         &self,
-        _request: Request<GetTransactionsRequest>,
+        request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsReply>, Status> {
-        todo!()
+        let txs: Vec<_> = request
+            .into_inner()
+            .hashes
+            .into_iter()
+            .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
+            .map(|tx| {
+                let mut stream = rlp::RlpStream::new();
+                tx.encode(&mut stream);
+                stream.drain()
+            })
+            .collect();
+
+        Ok(Response::new(GetTransactionsReply { txs }))
     }
 }
 
