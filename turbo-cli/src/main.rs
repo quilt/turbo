@@ -7,9 +7,11 @@ use structopt::StructOpt;
 use tonic::transport::channel::Channel;
 use tonic::transport::Uri;
 
-use turbo_proto::tonic;
+use turbo_proto::txpool::txpool_client::TxpoolClient;
 use turbo_proto::txpool::txpool_control_client::TxpoolControlClient;
-use turbo_proto::txpool::AccountInfoRequest;
+use turbo_proto::txpool::{
+    AccountInfoRequest, GetTransactionsRequest, ImportRequest, TxHashes,
+};
 
 mod cmd {
     use super::*;
@@ -89,7 +91,82 @@ mod cmd {
     }
 
     #[derive(Debug, StructOpt)]
+    pub struct TxUnknown {
+        #[structopt(parse(try_from_str=hex))]
+        hashes: Vec<[u8; 32]>,
+    }
+
+    impl TxUnknown {
+        pub async fn run(
+            self,
+            dst: Uri,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let hashes: Vec<_> =
+                self.hashes.into_iter().map(Vec::from).collect();
+
+            let mut client = TxpoolClient::connect(dst).await?;
+            let txs = client
+                .find_unknown_transactions(TxHashes { hashes })
+                .await?;
+
+            println!("{:?}", txs);
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, StructOpt)]
+    pub struct TxGet {
+        #[structopt(parse(try_from_str=hex))]
+        hashes: Vec<[u8; 32]>,
+    }
+
+    impl TxGet {
+        pub async fn run(
+            self,
+            dst: Uri,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let hashes: Vec<_> =
+                self.hashes.into_iter().map(Vec::from).collect();
+
+            let mut client = TxpoolClient::connect(dst).await?;
+            let txs = client
+                .get_transactions(GetTransactionsRequest { hashes })
+                .await?;
+
+            println!("{:?}", txs);
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, StructOpt)]
+    pub struct TxImport {
+        #[structopt(parse(try_from_str=hex))]
+        txs: Vec<Vec<u8>>,
+    }
+
+    impl TxImport {
+        pub async fn run(
+            self,
+            dst: Uri,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut client = TxpoolClient::connect(dst).await?;
+            let txs = client
+                .import_transactions(ImportRequest { txs: self.txs })
+                .await?;
+
+            println!("{:?}", txs);
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, StructOpt)]
     pub enum TxPool {
+        Unknown(TxUnknown),
+        Import(TxImport),
+        Get(TxGet),
         Control(TxControl),
     }
 
@@ -99,6 +176,9 @@ mod cmd {
             dst: Uri,
         ) -> Result<(), Box<dyn std::error::Error>> {
             match self {
+                TxPool::Unknown(un) => un.run(dst).await,
+                TxPool::Import(import) => import.run(dst).await,
+                TxPool::Get(get) => get.run(dst).await,
                 TxPool::Control(ctrl) => ctrl.run(dst).await,
             }
         }

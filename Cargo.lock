@@ -1253,6 +1253,7 @@ dependencies = [
  "hex",
  "structopt",
  "tokio",
+ "tonic",
  "turbo-proto",
 ]
 
@@ -1275,6 +1276,7 @@ dependencies = [
  "snafu",
  "tiny-keccak",
  "tokio",
+ "tonic",
  "turbo-proto",
  "typed-builder",
 ]

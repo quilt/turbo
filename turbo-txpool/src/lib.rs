@@ -10,13 +10,14 @@ use slab::Slab;
 
 use std::collections::{hash_map, BTreeSet, HashMap};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use tokio::sync::RwLock;
 
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use turbo_proto::tonic;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
     GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
@@ -104,7 +105,7 @@ impl Inner {
             .into_inner()
             .hashes
             .into_iter()
-            .filter(|vec| self.by_hash.contains_key(&H256::from_slice(&vec)))
+            .filter(|vec| !self.by_hash.contains_key(&H256::from_slice(&vec)))
             .collect();
 
         Ok(Response::new(TxHashes { hashes }))
@@ -169,6 +170,16 @@ impl TxPool {
         Self {
             inner: RwLock::new(Inner::with_config(config)),
         }
+    }
+
+    pub async fn run<I>(self, addr: I) -> Result<(), tonic::transport::Error>
+    where
+        I: Into<SocketAddr>,
+    {
+        Server::builder()
+            .add_service(server::TxpoolServer::new(self))
+            .serve(addr.into())
+            .await
     }
 
     pub async fn find_unknown_transactions(
