@@ -10,13 +10,14 @@ use slab::Slab;
 
 use std::collections::{hash_map, BTreeSet, HashMap};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 use tokio::sync::RwLock;
 
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use turbo_proto::tonic;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
     GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
@@ -41,6 +42,10 @@ impl Inner {
 
     fn cheapest(&self) -> Option<&Tx> {
         self.cheapest_key().map(|k| &self.txs[k])
+    }
+
+    fn by_hash(&self, hash: &H256) -> Option<&Tx> {
+        self.by_hash.get(hash).and_then(|k| self.txs.get(*k))
     }
 
     fn insert(&mut self, tx: Tx) -> ImportResult {
@@ -100,7 +105,7 @@ impl Inner {
             .into_inner()
             .hashes
             .into_iter()
-            .filter(|vec| self.by_hash.contains_key(&H256::from_slice(&vec)))
+            .filter(|vec| !self.by_hash.contains_key(&H256::from_slice(&vec)))
             .collect();
 
         Ok(Response::new(TxHashes { hashes }))
@@ -133,9 +138,21 @@ impl Inner {
 
     pub fn get_transactions(
         &self,
-        _request: Request<GetTransactionsRequest>,
+        request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsReply>, Status> {
-        todo!()
+        let txs: Vec<_> = request
+            .into_inner()
+            .hashes
+            .into_iter()
+            .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
+            .map(|tx| {
+                let mut stream = rlp::RlpStream::new();
+                tx.encode(&mut stream);
+                stream.drain()
+            })
+            .collect();
+
+        Ok(Response::new(GetTransactionsReply { txs }))
     }
 }
 
@@ -153,6 +170,16 @@ impl TxPool {
         Self {
             inner: RwLock::new(Inner::with_config(config)),
         }
+    }
+
+    pub async fn run<I>(self, addr: I) -> Result<(), tonic::transport::Error>
+    where
+        I: Into<SocketAddr>,
+    {
+        Server::builder()
+            .add_service(server::TxpoolServer::new(self))
+            .serve(addr.into())
+            .await
     }
 
     pub async fn find_unknown_transactions(

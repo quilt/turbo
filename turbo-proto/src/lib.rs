@@ -1,5 +1,4 @@
 pub extern crate prost;
-pub extern crate tonic;
 
 pub mod txpool {
     tonic::include_proto!("txpool");
