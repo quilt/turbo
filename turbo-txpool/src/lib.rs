@@ -2,7 +2,7 @@ pub mod error;
 mod tx;
 
 use crate::error::Error;
-use crate::tx::{Priced, Tx};
+use crate::tx::{Priced, Tx, VerifiedTx};
 
 use ethereum_types::H256;
 
@@ -28,7 +28,7 @@ use typed_builder::TypedBuilder;
 
 #[derive(Debug)]
 struct Inner {
-    txs: Slab<Tx>,
+    txs: Slab<VerifiedTx>,
     by_hash: HashMap<H256, usize>,
     by_price: BTreeSet<Priced>,
 
@@ -40,30 +40,35 @@ impl Inner {
         self.by_price.iter().next().map(|p| p.key)
     }
 
-    fn cheapest(&self) -> Option<&Tx> {
+    fn cheapest(&self) -> Option<&VerifiedTx> {
         self.cheapest_key().map(|k| &self.txs[k])
     }
 
-    fn by_hash(&self, hash: &H256) -> Option<&Tx> {
+    fn by_hash(&self, hash: &H256) -> Option<&VerifiedTx> {
         self.by_hash.get(hash).and_then(|k| self.txs.get(*k))
     }
 
     fn insert(&mut self, tx: Tx) -> ImportResult {
         if self.txs.len() >= self.max_txs {
             let cheapest =
-                self.cheapest().map(|t| t.gas_price).unwrap_or_default();
+                self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
             if tx.gas_price <= cheapest {
                 return ImportResult::FeeTooLow;
             }
         }
 
-        let by_hash = match self.by_hash.entry(tx.hash) {
+        let verified = match VerifiedTx::new(tx) {
+            Ok(v) => v,
+            Err(_) => return ImportResult::Invalid,
+        };
+
+        let by_hash = match self.by_hash.entry(*verified.hash()) {
             hash_map::Entry::Vacant(v) => v,
             hash_map::Entry::Occupied(_) => return ImportResult::AlreadyExists,
         };
 
-        let gas_price = tx.gas_price;
-        let key = self.txs.insert(tx);
+        let gas_price = *verified.gas_price();
+        let key = self.txs.insert(verified);
 
         let inserted = self.by_price.insert(Priced { gas_price, key });
         assert!(inserted);
@@ -79,10 +84,10 @@ impl Inner {
 
     fn remove(&mut self, key: usize) {
         let tx = self.txs.remove(key);
-        self.by_hash.remove(&tx.hash).expect("desync by hash");
+        self.by_hash.remove(tx.hash()).expect("desync by hash");
 
         let removed = self.by_price.remove(&Priced {
-            gas_price: tx.gas_price,
+            gas_price: *tx.gas_price(),
             key,
         });
         assert!(removed, "desync by price");
@@ -145,9 +150,9 @@ impl Inner {
             .hashes
             .into_iter()
             .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
-            .map(|tx| {
+            .map(|verified| {
                 let mut stream = rlp::RlpStream::new();
-                tx.encode(&mut stream);
+                verified.tx().encode(&mut stream);
                 stream.drain()
             })
             .collect();
@@ -259,6 +264,8 @@ impl server::Txpool for TxPool {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryInto;
+
     use super::*;
 
     fn inner() -> Inner {
@@ -266,39 +273,43 @@ mod tests {
         Inner::with_config(cfg)
     }
 
+    fn vtx(gas_price: u64) -> VerifiedTx {
+        tx(gas_price).try_into().unwrap()
+    }
+
     fn tx(gas_price: u64) -> Tx {
         Tx {
             gas_price: gas_price.into(),
             gas_limit: Default::default(),
-            hash: H256::from_low_u64_be(gas_price),
             nonce: Default::default(),
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: Default::default(),
-            s: Default::default(),
+            r: 1.into(),
+            s: 1.into(),
             value: Default::default(),
         }
+        .into()
     }
 
     #[test]
     fn cheapest() {
         let mut txs = Slab::new();
-        let k0 = txs.insert(tx(100));
-        let k1 = txs.insert(tx(101));
+        let k0 = txs.insert(vtx(100));
+        let k1 = txs.insert(vtx(101));
 
         let mut by_hash = HashMap::new();
-        by_hash.insert(txs[k0].hash, k0);
-        by_hash.insert(txs[k1].hash, k1);
+        by_hash.insert(*txs[k0].hash(), k0);
+        by_hash.insert(*txs[k1].hash(), k1);
 
         let mut by_price = BTreeSet::new();
         by_price.insert(Priced {
             key: k0,
-            gas_price: txs[k0].gas_price,
+            gas_price: *txs[k0].gas_price(),
         });
         by_price.insert(Priced {
             key: k1,
-            gas_price: txs[k1].gas_price,
+            gas_price: *txs[k1].gas_price(),
         });
 
         let inner = Inner {
@@ -315,31 +326,31 @@ mod tests {
     #[test]
     fn insert_2() {
         let mut inner = inner();
-        let tx0 = tx(100);
-        let tx1 = tx(101);
+        let tx0 = vtx(100);
+        let tx1 = vtx(101);
 
-        let result = inner.insert(tx0.clone());
+        let result = inner.insert(tx0.tx().clone());
         assert_eq!(result, ImportResult::Success);
 
-        let result2 = inner.insert(tx1.clone());
+        let result2 = inner.insert(tx1.tx().clone());
         assert_eq!(result2, ImportResult::Success);
 
         assert_eq!(inner.txs.len(), 2);
         assert_eq!(inner.by_hash.len(), 2);
         assert_eq!(inner.by_price.len(), 2);
 
-        assert_eq!(inner.txs[inner.by_hash[&tx0.hash]], tx0);
-        assert_eq!(inner.txs[inner.by_hash[&tx1.hash]], tx1);
+        assert_eq!(inner.txs[inner.by_hash[tx0.hash()]], tx0);
+        assert_eq!(inner.txs[inner.by_hash[tx1.hash()]], tx1);
 
         let mut iter = inner.by_price.iter();
         let i0 = iter.next().unwrap();
         let i1 = iter.next().unwrap();
 
         assert_eq!(inner.txs[i0.key], tx0);
-        assert_eq!(i0.gas_price, tx0.gas_price);
+        assert_eq!(i0.gas_price, *tx0.gas_price());
 
         assert_eq!(inner.txs[i1.key], tx1);
-        assert_eq!(i1.gas_price, tx1.gas_price);
+        assert_eq!(i1.gas_price, *tx1.gas_price());
     }
 
     #[test]
@@ -374,20 +385,20 @@ mod tests {
         let r0 = inner.insert(tx0.clone());
         assert_eq!(r0, ImportResult::Success);
 
-        let tx1 = tx(100);
-        let r1 = inner.insert(tx1.clone());
+        let tx1 = vtx(100);
+        let r1 = inner.insert(tx1.tx().clone());
         assert_eq!(r1, ImportResult::Success);
 
         assert_eq!(inner.txs.len(), 1);
         assert_eq!(inner.by_hash.len(), 1);
         assert_eq!(inner.by_price.len(), 1);
 
-        assert_eq!(inner.txs[inner.by_hash[&tx1.hash]], tx1);
+        assert_eq!(inner.txs[inner.by_hash[tx1.hash()]], tx1);
 
         let mut iter = inner.by_price.iter();
         let i0 = iter.next().unwrap();
 
         assert_eq!(inner.txs[i0.key], tx1);
-        assert_eq!(i0.gas_price, tx1.gas_price);
+        assert_eq!(i0.gas_price, *tx1.gas_price());
     }
 }
