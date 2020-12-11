@@ -2,20 +2,96 @@ use crate::error::{Error, RlpResultExt};
 
 use ethereum_types::{Address, H256, U256};
 
+pub use k256::ecdsa::Error as EcdsaError;
+use k256::ecdsa::{self, recoverable};
+use k256::EncodedPoint;
+
+use std::convert::{TryFrom, TryInto};
+
 use tiny_keccak::{Hasher, Keccak};
 
-fn keccak(input: &[u8]) -> H256 {
+fn keccak(input: &[u8]) -> [u8; 32] {
     let mut keccak = Keccak::v256();
     keccak.update(input);
 
     let mut output = [0u8; 32];
     keccak.finalize(&mut output);
-    H256::from(output)
+    output
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedTx {
+    hash: H256,
+    from: Address,
+    tx: Tx,
+}
+
+impl VerifiedTx {
+    pub fn new(tx: Tx) -> Result<Self, EcdsaError> {
+        let v = 1 - (tx.v % 2);
+        let mut r = [0u8; 32];
+        tx.r.to_big_endian(&mut r);
+        let mut s = [0u8; 32];
+        tx.s.to_big_endian(&mut s);
+
+        let sig = recoverable::Signature::new(
+            &ecdsa::Signature::from_scalars(r, s)?,
+            recoverable::Id::new(v.try_into().unwrap())?,
+        )?;
+
+        let mut stream = rlp::RlpStream::new();
+        tx.signature_encode(&mut stream);
+        let vkey = sig.recover_verify_key(stream.as_raw())?;
+
+        let point = EncodedPoint::from(&vkey).decompress();
+
+        let pubkey = match point {
+            Some(k) => k.to_bytes(),
+            None => return Err(EcdsaError::new()),
+        };
+
+        let from = Address::from_slice(&keccak(&pubkey[1..])[12..]);
+
+        stream.clear();
+        tx.encode(&mut stream);
+        let hash = H256::from(keccak(stream.as_raw()));
+
+        Ok(Self { hash, from, tx })
+    }
+
+    pub fn gas_price(&self) -> &U256 {
+        &self.tx.gas_price
+    }
+
+    pub fn hash(&self) -> &H256 {
+        &self.hash
+    }
+
+    pub fn tx(&self) -> &Tx {
+        &self.tx
+    }
+
+    // TODO: Add getters as needed.
+}
+
+impl TryFrom<Tx> for VerifiedTx {
+    type Error = EcdsaError;
+
+    fn try_from(tx: Tx) -> Result<Self, Self::Error> {
+        VerifiedTx::new(tx)
+    }
+}
+
+impl Eq for VerifiedTx {}
+
+impl PartialEq for VerifiedTx {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Tx {
-    pub hash: H256,
     pub nonce: u64,
     pub to: Option<Address>,
     pub value: U256,
@@ -28,6 +104,52 @@ pub struct Tx {
 }
 
 impl Tx {
+    fn signature_encode(&self, stream: &mut rlp::RlpStream) {
+        if self.v >= 35 {
+            self.signature_encode_9(stream);
+        } else {
+            self.signature_encode_6(stream);
+        }
+    }
+
+    fn signature_encode_6(&self, stream: &mut rlp::RlpStream) {
+        stream.begin_list(6);
+        stream.append(&U256::from(self.nonce));
+        stream.append(&self.gas_price);
+        stream.append(&U256::from(self.gas_limit));
+        match self.to {
+            None => {
+                stream.append_empty_data();
+            }
+            Some(to) => {
+                stream.append(&to);
+            }
+        }
+        stream.append(&self.value);
+        stream.append(&self.input);
+    }
+
+    fn signature_encode_9(&self, stream: &mut rlp::RlpStream) {
+        let chainid = (self.v - 35) / 2;
+        stream.begin_list(9);
+        stream.append(&U256::from(self.nonce));
+        stream.append(&self.gas_price);
+        stream.append(&U256::from(self.gas_limit));
+        match self.to {
+            None => {
+                stream.append_empty_data();
+            }
+            Some(to) => {
+                stream.append(&to);
+            }
+        }
+        stream.append(&self.value);
+        stream.append(&self.input);
+        stream.append(&chainid);
+        stream.append(&0u8);
+        stream.append(&0u8);
+    }
+
     pub fn encode(&self, stream: &mut rlp::RlpStream) {
         stream.begin_list(9);
         stream.append(&U256::from(self.nonce));
@@ -49,8 +171,6 @@ impl Tx {
     }
 
     pub fn decode(stream: &rlp::Rlp) -> Result<Self, Error> {
-        let hash = keccak(stream.as_raw());
-
         let to = {
             let field = stream.at(3).context_field("to")?;
             if field.is_empty() {
@@ -87,7 +207,6 @@ impl Tx {
             };
 
         Ok(Self {
-            hash,
             nonce,
             gas_price: stream.val_at(1).context_field("gas_price")?,
             gas_limit,
@@ -189,7 +308,6 @@ mod tests {
             to: None,
             gas_limit: 6_721_975,
             gas_price: 20_000_000_000u64.into(),
-            hash: Default::default(),
             input,
             nonce: 82,
             v: 28,
@@ -286,14 +404,7 @@ mod tests {
             0x7b, 0xd2, 0xc8, 0x04,
         ];
 
-        let hash = H256::from([
-            0x20, 0x94, 0x66, 0xe8, 0xf6, 0xb9, 0x69, 0xc2, 0x07, 0x5b, 0xf5,
-            0x46, 0x93, 0x82, 0x65, 0xa1, 0x3e, 0xee, 0x23, 0xca, 0xf7, 0xd5,
-            0x9e, 0x4d, 0x7c, 0x4e, 0x54, 0xc2, 0x6e, 0xb4, 0x82, 0xec,
-        ]);
-
         let tx = Tx::decode(&rlp::Rlp::new(&txbytes))?;
-        assert_eq!(tx.hash, hash);
         assert_eq!(tx.input, &[]);
         assert_eq!(tx.gas_limit, 0x7fffffffffffffff);
         assert_eq!(tx.gas_price, 1.into());
@@ -331,6 +442,86 @@ mod tests {
             ]
             .into()
         );
+
+        let vtx = VerifiedTx::new(tx).unwrap();
+        let hash = H256::from([
+            0x20, 0x94, 0x66, 0xe8, 0xf6, 0xb9, 0x69, 0xc2, 0x07, 0x5b, 0xf5,
+            0x46, 0x93, 0x82, 0x65, 0xa1, 0x3e, 0xee, 0x23, 0xca, 0xf7, 0xd5,
+            0x9e, 0x4d, 0x7c, 0x4e, 0x54, 0xc2, 0x6e, 0xb4, 0x82, 0xec,
+        ]);
+        assert_eq!(vtx.hash, hash);
+
+        Ok(())
+    }
+
+    #[test]
+    fn decode_1000000() -> Result<(), Error> {
+        let txbytes = [
+            0xf8, 0x6e, 0x15, 0x85, 0x12, 0xbf, 0xb1, 0x9e, 0x60, 0x83, 0x01,
+            0xf8, 0xdc, 0x94, 0xc0, 0x83, 0xe9, 0x94, 0x7c, 0xf0, 0x2b, 0x8f,
+            0xfc, 0x7d, 0x30, 0x90, 0xae, 0x9a, 0xea, 0x72, 0xdf, 0x98, 0xfd,
+            0x47, 0x89, 0x05, 0x6b, 0xc7, 0x5e, 0x2d, 0x63, 0x10, 0x00, 0x00,
+            0x80, 0x1c, 0xa0, 0xa2, 0x54, 0xfe, 0x08, 0x5f, 0x72, 0x1c, 0x2a,
+            0xbe, 0x00, 0xa2, 0xcd, 0x24, 0x41, 0x10, 0xbf, 0xc0, 0xdf, 0x5f,
+            0x4f, 0x25, 0x46, 0x1c, 0x85, 0xd8, 0xab, 0x75, 0xeb, 0xac, 0x11,
+            0xeb, 0x10, 0xa0, 0x30, 0xb7, 0x83, 0x5b, 0xa4, 0x81, 0x95, 0x5b,
+            0x20, 0x19, 0x3a, 0x70, 0x3e, 0xbc, 0x5f, 0xdf, 0xfe, 0xab, 0x08,
+            0x1d, 0x63, 0x11, 0x71, 0x99, 0x04, 0x0c, 0xdf, 0x5a, 0x91, 0xc6,
+            0x87, 0x65,
+        ];
+
+        let tx = Tx::decode(&rlp::Rlp::new(&txbytes))?;
+        assert_eq!(tx.input, &[]);
+        assert_eq!(tx.gas_limit, 129244);
+        assert_eq!(tx.gas_price, 80525500000u64.into());
+        assert_eq!(tx.nonce, 21);
+        assert_eq!(tx.value, 100000000000000000000u128.into());
+        assert_eq!(tx.v, 0x1c);
+        assert_eq!(
+            tx.to,
+            Some(
+                [
+                    0xc0, 0x83, 0xe9, 0x94, 0x7c, 0xf0, 0x2b, 0x8f, 0xfc, 0x7d,
+                    0x30, 0x90, 0xae, 0x9a, 0xea, 0x72, 0xdf, 0x98, 0xfd, 0x47,
+                ]
+                .into()
+            )
+        );
+        assert_eq!(
+            tx.r,
+            [
+                0xa2, 0x54, 0xfe, 0x08, 0x5f, 0x72, 0x1c, 0x2a, 0xbe, 0x00,
+                0xa2, 0xcd, 0x24, 0x41, 0x10, 0xbf, 0xc0, 0xdf, 0x5f, 0x4f,
+                0x25, 0x46, 0x1c, 0x85, 0xd8, 0xab, 0x75, 0xeb, 0xac, 0x11,
+                0xeb, 0x10,
+            ]
+            .into()
+        );
+
+        assert_eq!(
+            tx.s,
+            [
+                0x30, 0xb7, 0x83, 0x5b, 0xa4, 0x81, 0x95, 0x5b, 0x20, 0x19,
+                0x3a, 0x70, 0x3e, 0xbc, 0x5f, 0xdf, 0xfe, 0xab, 0x08, 0x1d,
+                0x63, 0x11, 0x71, 0x99, 0x04, 0x0c, 0xdf, 0x5a, 0x91, 0xc6,
+                0x87, 0x65,
+            ]
+            .into()
+        );
+
+        let vtx = VerifiedTx::new(tx).unwrap();
+        let hash = H256::from([
+            0xea, 0x10, 0x93, 0xd4, 0x92, 0xa1, 0xdc, 0xb1, 0xbe, 0xf7, 0x08,
+            0xf7, 0x71, 0xa9, 0x9a, 0x96, 0xff, 0x05, 0xdc, 0xab, 0x81, 0xca,
+            0x76, 0xc3, 0x19, 0x40, 0x30, 0x01, 0x77, 0xfc, 0xf4, 0x9f,
+        ]);
+        assert_eq!(vtx.hash, hash);
+
+        let from = Address::from([
+            0x39, 0xfa, 0x8c, 0x5f, 0x27, 0x93, 0x45, 0x9d, 0x66, 0x22, 0x85,
+            0x7e, 0x7d, 0x9f, 0xbb, 0x4b, 0xd9, 0x17, 0x66, 0xd3,
+        ]);
+        assert_eq!(vtx.from, from);
 
         Ok(())
     }
