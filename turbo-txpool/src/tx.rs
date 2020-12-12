@@ -91,6 +91,8 @@ impl PartialEq for VerifiedTx {
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
 pub struct Tx {
     pub nonce: u64,
     pub to: Option<Address>,
@@ -150,7 +152,7 @@ impl Tx {
         stream.append(&0u8);
     }
 
-    pub fn encode(&self, stream: &mut rlp::RlpStream) {
+    pub(crate) fn encode(&self, stream: &mut rlp::RlpStream) {
         stream.begin_list(9);
         stream.append(&U256::from(self.nonce));
         stream.append(&self.gas_price);
@@ -170,7 +172,7 @@ impl Tx {
         stream.append(&self.s);
     }
 
-    pub fn decode(stream: &rlp::Rlp) -> Result<Self, Error> {
+    pub(crate) fn decode(stream: &rlp::Rlp) -> Result<Self, Error> {
         let to = {
             let field = stream.at(3).context_field("to")?;
             if field.is_empty() {
@@ -218,12 +220,6 @@ impl Tx {
             s,
         })
     }
-}
-
-#[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
-pub struct Priced {
-    pub gas_price: U256,
-    pub key: usize,
 }
 
 #[cfg(test)]

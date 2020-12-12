@@ -1,10 +1,13 @@
 pub mod error;
-mod tx;
+pub mod tx;
+
+#[cfg(feature = "arbitrary")]
+extern crate arbitrary_dep as arbitrary;
 
 use crate::error::Error;
-use crate::tx::{Priced, Tx, VerifiedTx};
+use crate::tx::{Tx, VerifiedTx};
 
-use ethereum_types::H256;
+use ethereum_types::{H256, U256};
 
 use slab::Slab;
 
@@ -19,12 +22,19 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use turbo_proto::txpool::txpool_server as server;
+pub use turbo_proto::txpool::ImportResult;
 use turbo_proto::txpool::{
     GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
-    ImportResult, TxHashes,
+    TxHashes,
 };
 
 use typed_builder::TypedBuilder;
+
+#[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
+struct Priced {
+    pub gas_price: U256,
+    pub key: usize,
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -116,6 +126,10 @@ impl Inner {
         Ok(Response::new(TxHashes { hashes }))
     }
 
+    pub fn insert_transactions(&mut self, txs: Vec<Tx>) -> Vec<ImportResult> {
+        txs.into_iter().map(|tx| self.insert(tx)).collect()
+    }
+
     pub fn import_transactions(
         &mut self,
         request: Request<ImportRequest>,
@@ -192,6 +206,13 @@ impl TxPool {
         request: Request<TxHashes>,
     ) -> Result<Response<TxHashes>, Status> {
         self.inner.read().await.find_unknown_transactions(request)
+    }
+
+    pub async fn insert_transactions(
+        &mut self,
+        txs: Vec<Tx>,
+    ) -> Vec<ImportResult> {
+        self.inner.write().await.insert_transactions(txs)
     }
 
     pub async fn import_transactions(
