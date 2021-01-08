@@ -115,26 +115,8 @@ impl<C> Inner<C> {
 
         Ok(Response::new(GetTransactionsReply { txs }))
     }
-}
 
-impl<C> Inner<C>
-where
-    C: Control,
-{
-    fn insert(&mut self, tx: Tx) -> ImportResult {
-        if self.txs.len() >= self.max_txs {
-            let cheapest =
-                self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
-            if tx.gas_price <= cheapest {
-                return ImportResult::FeeTooLow;
-            }
-        }
-
-        let verified = match VerifiedTx::new(tx) {
-            Ok(v) => v,
-            Err(_) => return ImportResult::Invalid,
-        };
-
+    fn insert(&mut self, verified: VerifiedTx) -> ImportResult {
         let by_hash = match self.by_hash.entry(*verified.hash()) {
             hash_map::Entry::Vacant(v) => v,
             hash_map::Entry::Occupied(_) => return ImportResult::AlreadyExists,
@@ -154,9 +136,43 @@ where
 
         ImportResult::Success
     }
+}
+
+impl<C> Inner<C>
+where
+    C: Control,
+{
+    fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
+        if self.txs.len() >= self.max_txs {
+            let cheapest =
+                self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
+            if tx.gas_price <= cheapest {
+                return Err(ImportResult::FeeTooLow);
+            }
+        }
+
+        let verified = match VerifiedTx::new(tx) {
+            Ok(v) => v,
+            Err(_) => return Err(ImportResult::Invalid),
+        };
+
+        Ok(verified)
+    }
 
     pub fn insert_transactions(&mut self, txs: Vec<Tx>) -> Vec<ImportResult> {
-        txs.into_iter().map(|tx| self.insert(tx)).collect()
+        let verified: Vec<_> =
+            txs.into_iter().map(|tx| self.qualify(tx)).collect();
+
+        let mut result = Vec::with_capacity(verified.len());
+        for res in verified.into_iter() {
+            let ins = match res {
+                Ok(vx) => self.insert(vx),
+                Err(e) => e,
+            };
+            result.push(ins);
+        }
+
+        result
     }
 
     pub fn import_transactions(
@@ -174,7 +190,10 @@ where
 
         for tx in txs.into_iter() {
             let result = match tx {
-                Ok(tx) => self.insert(tx),
+                Ok(tx) => match self.qualify(tx) {
+                    Ok(vx) => self.insert(vx),
+                    Err(e) => e,
+                },
                 Err(Error::RlpDecode { .. }) => ImportResult::Invalid,
                 Err(Error::IntegerOverflow) => ImportResult::InternalError,
             };
@@ -371,10 +390,10 @@ mod tests {
         let tx0 = vtx(100);
         let tx1 = vtx(101);
 
-        let result = inner.insert(tx0.tx().clone());
+        let result = inner.insert(inner.qualify(tx0.tx().clone()).unwrap());
         assert_eq!(result, ImportResult::Success);
 
-        let result2 = inner.insert(tx1.tx().clone());
+        let result2 = inner.insert(inner.qualify(tx1.tx().clone()).unwrap());
         assert_eq!(result2, ImportResult::Success);
 
         assert_eq!(inner.txs.len(), 2);
@@ -396,16 +415,16 @@ mod tests {
     }
 
     #[test]
-    fn insert_fee_too_low() {
+    fn qualify_fee_too_low() {
         let mut inner = Inner::with_config(
             TestControl,
             Config::builder().control("").max_txs(1).build(),
         );
 
-        let r0 = inner.insert(tx(100));
+        let r0 = inner.insert(inner.qualify(tx(100)).unwrap());
         assert_eq!(r0, ImportResult::Success);
 
-        let r1 = inner.insert(tx(99));
+        let r1 = inner.qualify(tx(99)).unwrap_err();
         assert_eq!(r1, ImportResult::FeeTooLow);
     }
 
@@ -413,10 +432,10 @@ mod tests {
     fn insert_already_exists() {
         let mut inner = inner();
 
-        let r0 = inner.insert(tx(100));
+        let r0 = inner.insert(inner.qualify(tx(100)).unwrap());
         assert_eq!(r0, ImportResult::Success);
 
-        let r1 = inner.insert(tx(100));
+        let r1 = inner.insert(inner.qualify(tx(100)).unwrap());
         assert_eq!(r1, ImportResult::AlreadyExists);
     }
 
@@ -428,11 +447,11 @@ mod tests {
         );
 
         let tx0 = tx(99);
-        let r0 = inner.insert(tx0.clone());
+        let r0 = inner.insert(inner.qualify(tx0.clone()).unwrap());
         assert_eq!(r0, ImportResult::Success);
 
         let tx1 = vtx(100);
-        let r1 = inner.insert(tx1.tx().clone());
+        let r1 = inner.insert(inner.qualify(tx1.tx().clone()).unwrap());
         assert_eq!(r1, ImportResult::Success);
 
         assert_eq!(inner.txs.len(), 1);
