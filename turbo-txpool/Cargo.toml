@@ -23,6 +23,7 @@ k256 = { version = "0.6.0", features = [ "ecdsa", "ecdsa-core", "keccak256", "st
 signature = { version = "1.2.2", default-features = false, features = [ "std" ] }
 async-trait = "0.1.42"
 futures-core = "0.3.9"
+futures-util = "0.3.9"
 
 [dependencies.arbitrary-dep]
 package ="arbitrary"

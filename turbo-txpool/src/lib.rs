@@ -142,7 +142,7 @@ impl<C> Inner<C>
 where
     C: Control,
 {
-    fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
+    async fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
         if self.txs.len() >= self.max_txs {
             let cheapest =
                 self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
@@ -159,9 +159,14 @@ where
         Ok(verified)
     }
 
-    pub fn insert_transactions(&mut self, txs: Vec<Tx>) -> Vec<ImportResult> {
-        let verified: Vec<_> =
-            txs.into_iter().map(|tx| self.qualify(tx)).collect();
+    pub async fn insert_transactions(
+        &mut self,
+        txs: Vec<Tx>,
+    ) -> Vec<ImportResult> {
+        let verified: Vec<_> = futures_util::future::join_all(
+            txs.into_iter().map(|tx| self.qualify(tx)),
+        )
+        .await;
 
         let mut result = Vec::with_capacity(verified.len());
         for res in verified.into_iter() {
@@ -175,27 +180,32 @@ where
         result
     }
 
-    pub fn import_transactions(
+    pub async fn import_transactions(
         &mut self,
         request: Request<ImportRequest>,
     ) -> Result<Response<ImportReply>, Status> {
-        let txs: Vec<_> = request
-            .into_inner()
-            .txs
-            .into_iter()
-            .map(|b| Tx::decode(&rlp::Rlp::new(&b)))
-            .collect();
+        let qualifiers = request.into_inner().txs.into_iter().map(|b| {
+            let decoded = Tx::decode(&rlp::Rlp::new(&b));
+
+            async {
+                match decoded {
+                    Ok(tx) => self.qualify(tx).await,
+                    Err(Error::RlpDecode { .. }) => Err(ImportResult::Invalid),
+                    Err(Error::IntegerOverflow) => {
+                        Err(ImportResult::InternalError)
+                    }
+                }
+            }
+        });
+
+        let txs = futures_util::future::join_all(qualifiers).await;
 
         let mut imported = Vec::with_capacity(txs.len());
 
         for tx in txs.into_iter() {
             let result = match tx {
-                Ok(tx) => match self.qualify(tx) {
-                    Ok(vx) => self.insert(vx),
-                    Err(e) => e,
-                },
-                Err(Error::RlpDecode { .. }) => ImportResult::Invalid,
-                Err(Error::IntegerOverflow) => ImportResult::InternalError,
+                Ok(tx) => self.insert(tx),
+                Err(e) => e,
             };
             imported.push(result as i32);
         }
@@ -249,14 +259,14 @@ impl TxPool {
         &mut self,
         txs: Vec<Tx>,
     ) -> Vec<ImportResult> {
-        self.inner.write().await.insert_transactions(txs)
+        self.inner.write().await.insert_transactions(txs).await
     }
 
     pub async fn import_transactions(
         &self,
         request: Request<ImportRequest>,
     ) -> Result<Response<ImportReply>, Status> {
-        self.inner.write().await.import_transactions(request)
+        self.inner.write().await.import_transactions(request).await
     }
 
     pub async fn get_transactions(
@@ -384,16 +394,18 @@ mod tests {
         assert_eq!(inner.cheapest(), Some(&inner.txs[0]));
     }
 
-    #[test]
-    fn insert_2() {
+    #[tokio::test]
+    async fn insert_2() {
         let mut inner = inner();
         let tx0 = vtx(100);
         let tx1 = vtx(101);
 
-        let result = inner.insert(inner.qualify(tx0.tx().clone()).unwrap());
+        let q0 = inner.qualify(tx0.tx().clone()).await.unwrap();
+        let result = inner.insert(q0);
         assert_eq!(result, ImportResult::Success);
 
-        let result2 = inner.insert(inner.qualify(tx1.tx().clone()).unwrap());
+        let q1 = inner.qualify(tx1.tx().clone()).await.unwrap();
+        let result2 = inner.insert(q1);
         assert_eq!(result2, ImportResult::Success);
 
         assert_eq!(inner.txs.len(), 2);
@@ -414,44 +426,49 @@ mod tests {
         assert_eq!(i1.gas_price, *tx1.gas_price());
     }
 
-    #[test]
-    fn qualify_fee_too_low() {
+    #[tokio::test]
+    async fn qualify_fee_too_low() {
         let mut inner = Inner::with_config(
             TestControl,
             Config::builder().control("").max_txs(1).build(),
         );
 
-        let r0 = inner.insert(inner.qualify(tx(100)).unwrap());
+        let q0 = inner.qualify(tx(100)).await.unwrap();
+        let r0 = inner.insert(q0);
         assert_eq!(r0, ImportResult::Success);
 
-        let r1 = inner.qualify(tx(99)).unwrap_err();
+        let r1 = inner.qualify(tx(99)).await.unwrap_err();
         assert_eq!(r1, ImportResult::FeeTooLow);
     }
 
-    #[test]
-    fn insert_already_exists() {
+    #[tokio::test]
+    async fn insert_already_exists() {
         let mut inner = inner();
 
-        let r0 = inner.insert(inner.qualify(tx(100)).unwrap());
+        let q0 = inner.qualify(tx(100)).await.unwrap();
+        let r0 = inner.insert(q0);
         assert_eq!(r0, ImportResult::Success);
 
-        let r1 = inner.insert(inner.qualify(tx(100)).unwrap());
+        let q1 = inner.qualify(tx(100)).await.unwrap();
+        let r1 = inner.insert(q1);
         assert_eq!(r1, ImportResult::AlreadyExists);
     }
 
-    #[test]
-    fn insert_evict() {
+    #[tokio::test]
+    async fn insert_evict() {
         let mut inner = Inner::with_config(
             TestControl,
             Config::builder().control("").max_txs(1).build(),
         );
 
         let tx0 = tx(99);
-        let r0 = inner.insert(inner.qualify(tx0.clone()).unwrap());
+        let q0 = inner.qualify(tx0).await.unwrap();
+        let r0 = inner.insert(q0);
         assert_eq!(r0, ImportResult::Success);
 
         let tx1 = vtx(100);
-        let r1 = inner.insert(inner.qualify(tx1.tx().clone()).unwrap());
+        let q1 = inner.qualify(tx1.tx().clone()).await.unwrap();
+        let r1 = inner.insert(q1);
         assert_eq!(r1, ImportResult::Success);
 
         assert_eq!(inner.txs.len(), 1);
