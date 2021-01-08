@@ -1,9 +1,11 @@
+mod control;
 pub mod error;
 pub mod tx;
 
 #[cfg(feature = "arbitrary")]
 extern crate arbitrary_dep as arbitrary;
 
+use crate::control::{Control, PbControl};
 use crate::error::Error;
 use crate::tx::{Tx, VerifiedTx};
 
@@ -21,6 +23,7 @@ use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use turbo_proto::txpool::txpool_control_client as client;
 use turbo_proto::txpool::txpool_server as server;
 pub use turbo_proto::txpool::ImportResult;
 use turbo_proto::txpool::{
@@ -37,7 +40,8 @@ struct Priced {
 }
 
 #[derive(Debug)]
-struct Inner {
+struct Inner<C> {
+    control: C,
     txs: Slab<VerifiedTx>,
     by_hash: HashMap<H256, usize>,
     by_price: BTreeSet<Priced>,
@@ -45,7 +49,7 @@ struct Inner {
     max_txs: usize,
 }
 
-impl Inner {
+impl<C> Inner<C> {
     fn cheapest_key(&self) -> Option<usize> {
         self.by_price.iter().next().map(|p| p.key)
     }
@@ -58,6 +62,65 @@ impl Inner {
         self.by_hash.get(hash).and_then(|k| self.txs.get(*k))
     }
 
+    fn remove(&mut self, key: usize) {
+        let tx = self.txs.remove(key);
+        self.by_hash.remove(tx.hash()).expect("desync by hash");
+
+        let removed = self.by_price.remove(&Priced {
+            gas_price: *tx.gas_price(),
+            key,
+        });
+        assert!(removed, "desync by price");
+    }
+
+    pub fn find_unknown_transactions(
+        &self,
+        request: Request<TxHashes>,
+    ) -> Result<Response<TxHashes>, Status> {
+        let hashes = request
+            .into_inner()
+            .hashes
+            .into_iter()
+            .filter(|vec| !self.by_hash.contains_key(&H256::from_slice(&vec)))
+            .collect();
+
+        Ok(Response::new(TxHashes { hashes }))
+    }
+
+    pub fn with_config(control: C, config: Config) -> Self {
+        Self {
+            max_txs: config.max_txs,
+            txs: Slab::with_capacity(config.max_txs),
+            by_hash: HashMap::with_capacity(config.max_txs),
+            by_price: BTreeSet::new(),
+            control,
+        }
+    }
+
+    pub fn get_transactions(
+        &self,
+        request: Request<GetTransactionsRequest>,
+    ) -> Result<Response<GetTransactionsReply>, Status> {
+        let txs: Vec<_> = request
+            .into_inner()
+            .hashes
+            .into_iter()
+            .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
+            .map(|verified| {
+                let mut stream = rlp::RlpStream::new();
+                verified.tx().encode(&mut stream);
+                stream.drain()
+            })
+            .collect();
+
+        Ok(Response::new(GetTransactionsReply { txs }))
+    }
+}
+
+impl<C> Inner<C>
+where
+    C: Control,
+{
     fn insert(&mut self, tx: Tx) -> ImportResult {
         if self.txs.len() >= self.max_txs {
             let cheapest =
@@ -92,40 +155,6 @@ impl Inner {
         ImportResult::Success
     }
 
-    fn remove(&mut self, key: usize) {
-        let tx = self.txs.remove(key);
-        self.by_hash.remove(tx.hash()).expect("desync by hash");
-
-        let removed = self.by_price.remove(&Priced {
-            gas_price: *tx.gas_price(),
-            key,
-        });
-        assert!(removed, "desync by price");
-    }
-
-    pub fn with_config(config: Config) -> Self {
-        Self {
-            max_txs: config.max_txs,
-            txs: Slab::with_capacity(config.max_txs),
-            by_hash: HashMap::with_capacity(config.max_txs),
-            by_price: BTreeSet::new(),
-        }
-    }
-
-    pub fn find_unknown_transactions(
-        &self,
-        request: Request<TxHashes>,
-    ) -> Result<Response<TxHashes>, Status> {
-        let hashes = request
-            .into_inner()
-            .hashes
-            .into_iter()
-            .filter(|vec| !self.by_hash.contains_key(&H256::from_slice(&vec)))
-            .collect();
-
-        Ok(Response::new(TxHashes { hashes }))
-    }
-
     pub fn insert_transactions(&mut self, txs: Vec<Tx>) -> Vec<ImportResult> {
         txs.into_iter().map(|tx| self.insert(tx)).collect()
     }
@@ -154,41 +183,30 @@ impl Inner {
 
         Ok(Response::new(ImportReply { imported }))
     }
-
-    pub fn get_transactions(
-        &self,
-        request: Request<GetTransactionsRequest>,
-    ) -> Result<Response<GetTransactionsReply>, Status> {
-        let txs: Vec<_> = request
-            .into_inner()
-            .hashes
-            .into_iter()
-            .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
-            .map(|verified| {
-                let mut stream = rlp::RlpStream::new();
-                verified.tx().encode(&mut stream);
-                stream.drain()
-            })
-            .collect();
-
-        Ok(Response::new(GetTransactionsReply { txs }))
-    }
 }
 
 #[derive(Debug, TypedBuilder)]
 pub struct Config {
     max_txs: usize,
+    #[builder(setter(into))]
+    control: String,
 }
 
 pub struct TxPool {
-    inner: RwLock<Inner>,
+    inner: RwLock<Inner<PbControl>>,
 }
 
 impl TxPool {
-    pub fn with_config(config: Config) -> Self {
-        Self {
-            inner: RwLock::new(Inner::with_config(config)),
-        }
+    pub async fn with_config(
+        config: Config,
+    ) -> Result<Self, tonic::transport::Error> {
+        let client =
+            client::TxpoolControlClient::connect(config.control.clone())
+                .await?;
+        let control = PbControl::new(client);
+        Ok(Self {
+            inner: RwLock::new(Inner::with_config(control, config)),
+        })
     }
 
     pub async fn run<I>(self, addr: I) -> Result<(), tonic::transport::Error>
@@ -285,13 +303,15 @@ impl server::Txpool for TxPool {
 
 #[cfg(test)]
 mod tests {
+    use crate::control::tests::TestControl;
+
     use std::convert::TryInto;
 
     use super::*;
 
-    fn inner() -> Inner {
-        let cfg = Config::builder().max_txs(10).build();
-        Inner::with_config(cfg)
+    fn inner() -> Inner<TestControl> {
+        let cfg = Config::builder().max_txs(10).control(String::new()).build();
+        Inner::with_config(TestControl, cfg)
     }
 
     fn vtx(gas_price: u64) -> VerifiedTx {
@@ -337,6 +357,7 @@ mod tests {
             txs,
             by_hash,
             by_price,
+            control: TestControl,
             max_txs: 2,
         };
 
@@ -376,8 +397,10 @@ mod tests {
 
     #[test]
     fn insert_fee_too_low() {
-        let mut inner =
-            Inner::with_config(Config::builder().max_txs(1).build());
+        let mut inner = Inner::with_config(
+            TestControl,
+            Config::builder().control("").max_txs(1).build(),
+        );
 
         let r0 = inner.insert(tx(100));
         assert_eq!(r0, ImportResult::Success);
@@ -399,8 +422,10 @@ mod tests {
 
     #[test]
     fn insert_evict() {
-        let mut inner =
-            Inner::with_config(Config::builder().max_txs(1).build());
+        let mut inner = Inner::with_config(
+            TestControl,
+            Config::builder().control("").max_txs(1).build(),
+        );
 
         let tx0 = tx(99);
         let r0 = inner.insert(tx0.clone());
