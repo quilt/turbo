@@ -9,7 +9,7 @@ use crate::control::{Control, PbControl};
 use crate::error::Error;
 use crate::tx::{Tx, VerifiedTx};
 
-use ethereum_types::{H256, U256};
+use ethereum_types::{H256, U256, Address};
 
 use slab::Slab;
 
@@ -17,18 +17,22 @@ use std::collections::{hash_map, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use tokio::stream::StreamExt;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use turbo_proto::txpool::block_stream_request::StartWith;
 use turbo_proto::txpool::txpool_control_client as client;
 use turbo_proto::txpool::txpool_server as server;
-pub use turbo_proto::txpool::{AccountInfoRequest, ImportResult};
 use turbo_proto::txpool::{
-    GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
-    TxHashes,
+    account_diff, block_diff, AccountDiff, AccountInfoRequest, AppliedBlock, BlockDiff,
+    BlockStreamRequest, GetTransactionsReply, GetTransactionsRequest,
+    ImportReply, ImportRequest, ImportResult, RevertedBlock, TxHashes,
 };
 
 use typed_builder::TypedBuilder;
@@ -144,10 +148,88 @@ impl<C> Inner<C>
 where
     C: Clone + Control,
 {
+    fn recheck(&mut self, diffs: &[AccountDiff]) {
+        #[derive(Default)]
+        struct Account {
+            balance: U256,
+            nonce: U256,
+        }
+
+        let mut accounts = HashMap::with_capacity(diffs.len());
+        for diff in diffs {
+            let account;
+            let address;
+
+            match &diff.diff {
+                Some(account_diff::Diff::Deleted(addr)) => {
+                    account = Account::default();
+                    address = Address::from_slice(&addr);
+                },
+                Some(account_diff::Diff::Changed(delta)) => {
+                    address = Address::from_slice(&delta.address);
+                    account = Account {
+                        balance: U256::from_big_endian(&delta.balance),
+                        nonce: U256::from_big_endian(&delta.nonce),
+                    };
+                },
+                None => continue,
+            };
+
+            accounts.insert(address, account);
+        }
+
+        let mut to_remove = Vec::new();
+        for (key, tx) in self.txs.iter() {
+            let account = match accounts.get(tx.from()) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            if Self::validate(tx, account.nonce, account.balance).is_err() {
+                to_remove.push(key);
+            }
+        }
+
+        for key in to_remove.into_iter() {
+            self.remove(key);
+        }
+    }
+
+    async fn block_reverted(&mut self, block: RevertedBlock) {
+        self.latest_block = Some(H256::from_slice(&block.new_hash));
+
+        let req = ImportRequest {
+            txs: block.reverted_transactions,
+        };
+
+        self.recheck(&block.new_state);
+        self.import_transactions_request(req).await.ok();
+    }
+
+    async fn block_applied(&mut self, block: AppliedBlock) {
+        let hash = H256::from_slice(&block.hash);
+        self.latest_block = Some(hash);
+        self.recheck(&block.account_diffs);
+    }
+
+    async fn block_diff(&mut self, block_diff: BlockDiff) {
+        let diff = match block_diff.diff {
+            Some(d) => d,
+            None => return,
+        };
+
+        match diff {
+            block_diff::Diff::Applied(a) => self.block_applied(a).await,
+            block_diff::Diff::Reverted(r) => self.block_reverted(r).await,
+        }
+    }
+
     async fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
         let latest_block = match self.latest_block {
             Some(b) => b,
-            None => return Err(ImportResult::InternalError),
+            None => {
+                return Err(ImportResult::InternalError);
+            }
         };
 
         if self.txs.len() >= self.max_txs {
@@ -160,7 +242,9 @@ where
 
         let verified = match VerifiedTx::new(tx) {
             Ok(v) => v,
-            Err(_) => return Err(ImportResult::Invalid),
+            Err(_) => {
+                return Err(ImportResult::Invalid);
+            }
         };
 
         let req = AccountInfoRequest {
@@ -175,12 +259,17 @@ where
             .map_err(|_| ImportResult::InternalError)?;
 
         let nonce = U256::from_big_endian(&account.nonce);
+        let balance = U256::from_big_endian(&account.balance);
 
-        if U256::from(verified.nonce()) != (nonce + 1) {
+        Self::validate(&verified, nonce, balance)?;
+        Ok(verified)
+    }
+
+    fn validate(verified: &VerifiedTx, nonce: U256, balance: U256) -> Result<(), ImportResult> {
+        if U256::from(verified.nonce()) != nonce {
             return Err(ImportResult::Invalid);
         }
 
-        let balance = U256::from_big_endian(&account.balance);
         let required =
             (verified.gas_price() * verified.gas_limit()) + verified.value();
 
@@ -188,7 +277,7 @@ where
             return Err(ImportResult::Invalid);
         }
 
-        Ok(verified)
+        Ok(())
     }
 
     pub async fn insert_transactions(
@@ -216,7 +305,16 @@ where
         &mut self,
         request: Request<ImportRequest>,
     ) -> Result<Response<ImportReply>, Status> {
-        let qualifiers = request.into_inner().txs.into_iter().map(|b| {
+        self.import_transactions_request(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn import_transactions_request(
+        &mut self,
+        request: ImportRequest,
+    ) -> Result<ImportReply, Status> {
+        let qualifiers = request.txs.into_iter().map(|b| {
             let decoded = Tx::decode(&rlp::Rlp::new(&b));
 
             async {
@@ -242,7 +340,7 @@ where
             imported.push(result as i32);
         }
 
-        Ok(Response::new(ImportReply { imported }))
+        Ok(ImportReply { imported })
     }
 }
 
@@ -254,7 +352,8 @@ pub struct Config {
 }
 
 pub struct TxPool {
-    inner: RwLock<Inner<PbControl>>,
+    inner: Arc<RwLock<Inner<PbControl>>>,
+    background: Option<JoinHandle<()>>,
 }
 
 impl TxPool {
@@ -265,19 +364,53 @@ impl TxPool {
             client::TxpoolControlClient::connect(config.control.clone())
                 .await?;
         let control = PbControl::new(client);
+        let mut stream_control = control.clone();
+
+        let inner = Arc::new(RwLock::new(Inner::with_config(control, config)));
+        let stream_inner = inner.clone();
+
+        let background = tokio::spawn(async move {
+            let request = BlockStreamRequest {
+                start_with: Some(StartWith::Latest(())),
+            };
+
+            let mut stream =
+                stream_control.block_stream(request).await.unwrap();
+
+            while let Some(resp) = stream.next().await {
+                if let Ok(diff) = resp {
+                    let mut guard = stream_inner.write().await;
+                    guard.block_diff(diff).await;
+                }
+            }
+        });
+
         Ok(Self {
-            inner: RwLock::new(Inner::with_config(control, config)),
+            inner,
+            background: Some(background),
         })
     }
 
-    pub async fn run<I>(self, addr: I) -> Result<(), tonic::transport::Error>
+    pub async fn run<I>(
+        mut self,
+        addr: I,
+    ) -> Result<(), tonic::transport::Error>
     where
         I: Into<SocketAddr>,
     {
-        Server::builder()
+        let background = self.background.take().unwrap();
+
+        let server = Server::builder()
             .add_service(server::TxpoolServer::new(self))
-            .serve(addr.into())
-            .await
+            .serve(addr.into());
+
+        tokio::select! {
+            server_result = server => server_result,
+            bg_result = background => {
+                bg_result.expect("background task exited with panic");
+                panic!("background task exited unexpectedly (without panic)");
+            }
+        }
     }
 
     pub async fn find_unknown_transactions(
@@ -385,7 +518,7 @@ mod tests {
         Tx {
             gas_price: gas_price.into(),
             gas_limit: Default::default(),
-            nonce: 1,
+            nonce: 0,
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
