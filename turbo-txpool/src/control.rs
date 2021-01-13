@@ -25,7 +25,7 @@ pub trait Control {
     ) -> Result<AccountInfoReply, Status>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PbControl {
     client: TxpoolControlClient<Channel>,
 }
@@ -63,10 +63,16 @@ impl PbControl {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use hex_literal::hex;
+
     use super::*;
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     pub struct TestControl;
+
+    const BALANCE: [u8; 32] = hex!(
+        "000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFF"
+    );
 
     #[async_trait]
     impl Control for TestControl {
@@ -74,16 +80,19 @@ pub(crate) mod tests {
 
         async fn block_stream(
             &mut self,
-            request: BlockStreamRequest,
+            _request: BlockStreamRequest,
         ) -> Result<Self::BlockStream, Status> {
             Ok(tokio::stream::pending())
         }
 
         async fn account_info(
             &mut self,
-            request: AccountInfoRequest,
+            _request: AccountInfoRequest,
         ) -> Result<AccountInfoReply, Status> {
-            Err(Status::not_found("TODO"))
+            Ok(AccountInfoReply {
+                nonce: Default::default(),
+                balance: BALANCE.into(),
+            })
         }
     }
 }

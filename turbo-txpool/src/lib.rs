@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 
 use turbo_proto::txpool::txpool_control_client as client;
 use turbo_proto::txpool::txpool_server as server;
-pub use turbo_proto::txpool::ImportResult;
+pub use turbo_proto::txpool::{AccountInfoRequest, ImportResult};
 use turbo_proto::txpool::{
     GetTransactionsReply, GetTransactionsRequest, ImportReply, ImportRequest,
     TxHashes,
@@ -46,6 +46,7 @@ struct Inner<C> {
     by_hash: HashMap<H256, usize>,
     by_price: BTreeSet<Priced>,
 
+    latest_block: Option<H256>,
     max_txs: usize,
 }
 
@@ -89,6 +90,7 @@ impl<C> Inner<C> {
 
     pub fn with_config(control: C, config: Config) -> Self {
         Self {
+            latest_block: None,
             max_txs: config.max_txs,
             txs: Slab::with_capacity(config.max_txs),
             by_hash: HashMap::with_capacity(config.max_txs),
@@ -140,9 +142,14 @@ impl<C> Inner<C> {
 
 impl<C> Inner<C>
 where
-    C: Control,
+    C: Clone + Control,
 {
     async fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
+        let latest_block = match self.latest_block {
+            Some(b) => b,
+            None => return Err(ImportResult::InternalError),
+        };
+
         if self.txs.len() >= self.max_txs {
             let cheapest =
                 self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
@@ -155,6 +162,31 @@ where
             Ok(v) => v,
             Err(_) => return Err(ImportResult::Invalid),
         };
+
+        let req = AccountInfoRequest {
+            account: verified.from().as_bytes().to_owned(),
+            block_hash: Vec::from(latest_block.to_fixed_bytes()),
+        };
+
+        let mut control = self.control.clone();
+        let account = control
+            .account_info(req)
+            .await
+            .map_err(|_| ImportResult::InternalError)?;
+
+        let nonce = U256::from_big_endian(&account.nonce);
+
+        if U256::from(verified.nonce()) != (nonce + 1) {
+            return Err(ImportResult::Invalid);
+        }
+
+        let balance = U256::from_big_endian(&account.balance);
+        let required =
+            (verified.gas_price() * verified.gas_limit()) + verified.value();
+
+        if balance < required {
+            return Err(ImportResult::Invalid);
+        }
 
         Ok(verified)
     }
@@ -340,7 +372,9 @@ mod tests {
 
     fn inner() -> Inner<TestControl> {
         let cfg = Config::builder().max_txs(10).control(String::new()).build();
-        Inner::with_config(TestControl, cfg)
+        let mut out = Inner::with_config(TestControl, cfg);
+        out.latest_block = Some(Default::default());
+        out
     }
 
     fn vtx(gas_price: u64) -> VerifiedTx {
@@ -351,7 +385,7 @@ mod tests {
         Tx {
             gas_price: gas_price.into(),
             gas_limit: Default::default(),
-            nonce: Default::default(),
+            nonce: 1,
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
@@ -383,6 +417,7 @@ mod tests {
         });
 
         let inner = Inner {
+            latest_block: Some(Default::default()),
             txs,
             by_hash,
             by_price,
@@ -432,6 +467,7 @@ mod tests {
             TestControl,
             Config::builder().control("").max_txs(1).build(),
         );
+        inner.latest_block = Some(Default::default());
 
         let q0 = inner.qualify(tx(100)).await.unwrap();
         let r0 = inner.insert(q0);
@@ -460,6 +496,7 @@ mod tests {
             TestControl,
             Config::builder().control("").max_txs(1).build(),
         );
+        inner.latest_block = Some(Default::default());
 
         let tx0 = tx(99);
         let q0 = inner.qualify(tx0).await.unwrap();
@@ -482,5 +519,53 @@ mod tests {
 
         assert_eq!(inner.txs[i0.key], tx1);
         assert_eq!(i0.gas_price, *tx1.gas_price());
+    }
+
+    #[tokio::test]
+    async fn qualify_future_nonce() {
+        let mut inner = Inner::with_config(
+            TestControl,
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let tx0 = Tx {
+            gas_price: 1.into(),
+            gas_limit: Default::default(),
+            nonce: 10,
+            to: Default::default(),
+            input: Default::default(),
+            v: Default::default(),
+            r: 1.into(),
+            s: 1.into(),
+            value: Default::default(),
+        };
+
+        let q0 = inner.qualify(tx0).await.unwrap_err();
+        assert_eq!(q0, ImportResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn qualify_insufficient_balance() {
+        let mut inner = Inner::with_config(
+            TestControl,
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let tx0 = Tx {
+            gas_price: 1.into(),
+            gas_limit: Default::default(),
+            nonce: 1,
+            to: Default::default(),
+            input: Default::default(),
+            v: Default::default(),
+            r: 1.into(),
+            s: 1.into(),
+            value: 0xFFFFFFFFFFFFFFFFFu128.into(),
+        };
+
+        let q0 = inner.qualify(tx0).await.unwrap_err();
+        assert_eq!(q0, ImportResult::Invalid);
     }
 }
