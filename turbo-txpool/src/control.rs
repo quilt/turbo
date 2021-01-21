@@ -76,13 +76,13 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl Control for TestControl {
-        type BlockStream = tokio::stream::Pending<Result<BlockDiff, Status>>;
+        type BlockStream = tokio_stream::Pending<Result<BlockDiff, Status>>;
 
         async fn block_stream(
             &mut self,
             _request: BlockStreamRequest,
         ) -> Result<Self::BlockStream, Status> {
-            Ok(tokio::stream::pending())
+            Ok(tokio_stream::pending())
         }
 
         async fn account_info(

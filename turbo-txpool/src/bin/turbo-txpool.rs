@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use turbo_txpool::{Config, TxPool};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), tonic::transport::Error> {
     let config = Config::builder()
         .control("http://127.0.0.1:9092") // TODO

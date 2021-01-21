@@ -210,7 +210,7 @@ struct Opt {
     command: cmd::Command,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = Opt::from_args();
 

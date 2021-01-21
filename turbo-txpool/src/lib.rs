@@ -9,7 +9,7 @@ use crate::control::{Control, PbControl};
 use crate::error::Error;
 use crate::tx::{Tx, VerifiedTx};
 
-use ethereum_types::{H256, U256, Address};
+use ethereum_types::{Address, H256, U256};
 
 use slab::Slab;
 
@@ -19,9 +19,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::stream::StreamExt;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+
+use tokio_stream::StreamExt;
 
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -30,9 +31,10 @@ use turbo_proto::txpool::block_stream_request::StartWith;
 use turbo_proto::txpool::txpool_control_client as client;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
-    account_diff, block_diff, AccountDiff, AccountInfoRequest, AppliedBlock, BlockDiff,
-    BlockStreamRequest, GetTransactionsReply, GetTransactionsRequest,
-    ImportReply, ImportRequest, ImportResult, RevertedBlock, TxHashes,
+    account_diff, block_diff, AccountDiff, AccountInfoRequest, AppliedBlock,
+    BlockDiff, BlockStreamRequest, GetTransactionsReply,
+    GetTransactionsRequest, ImportReply, ImportRequest, ImportResult,
+    RevertedBlock, TxHashes,
 };
 
 use typed_builder::TypedBuilder;
@@ -115,7 +117,7 @@ impl<C> Inner<C> {
             .map(|verified| {
                 let mut stream = rlp::RlpStream::new();
                 verified.tx().encode(&mut stream);
-                stream.drain()
+                stream.as_raw().to_vec()
             })
             .collect();
 
@@ -164,14 +166,14 @@ where
                 Some(account_diff::Diff::Deleted(addr)) => {
                     account = Account::default();
                     address = Address::from_slice(&addr);
-                },
+                }
                 Some(account_diff::Diff::Changed(delta)) => {
                     address = Address::from_slice(&delta.address);
                     account = Account {
                         balance: U256::from_big_endian(&delta.balance),
                         nonce: U256::from_big_endian(&delta.nonce),
                     };
-                },
+                }
                 None => continue,
             };
 
@@ -265,7 +267,11 @@ where
         Ok(verified)
     }
 
-    fn validate(verified: &VerifiedTx, nonce: U256, balance: U256) -> Result<(), ImportResult> {
+    fn validate(
+        verified: &VerifiedTx,
+        nonce: U256,
+        balance: U256,
+    ) -> Result<(), ImportResult> {
         if U256::from(verified.nonce()) != nonce {
             return Err(ImportResult::Invalid);
         }
