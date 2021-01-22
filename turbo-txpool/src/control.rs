@@ -67,22 +67,51 @@ pub(crate) mod tests {
 
     use super::*;
 
-    #[derive(Clone, Debug)]
-    pub struct TestControl;
+    use std::pin::Pin;
 
-    const BALANCE: [u8; 32] = hex!(
-        "000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFF"
-    );
+    use tokio::sync::broadcast::{self, Sender};
+
+    #[derive(Clone, Debug)]
+    pub struct TestControl {
+        block_send: Sender<Result<BlockDiff, Status>>,
+    }
+
+    impl TestControl {
+        pub const BALANCE: [u8; 32] = hex!(
+            "000000000000000000000000000000000000000000000000FFFFFFFFFFFFFFFF"
+        );
+
+        pub fn new() -> Self {
+            let (block_send, _) = broadcast::channel(1);
+            Self { block_send }
+        }
+
+        #[allow(unused)] // TODO: Use this
+        pub fn stream_block(&self, result: Result<BlockDiff, Status>) {
+            self.block_send.send(result).unwrap();
+        }
+    }
 
     #[async_trait]
     impl Control for TestControl {
-        type BlockStream = tokio_stream::Pending<Result<BlockDiff, Status>>;
+        type BlockStream = Pin<
+            Box<
+                dyn futures_core::stream::Stream<
+                    Item = Result<BlockDiff, Status>,
+                >,
+            >,
+        >;
 
         async fn block_stream(
             &mut self,
             _request: BlockStreamRequest,
         ) -> Result<Self::BlockStream, Status> {
-            Ok(tokio_stream::pending())
+            let recv = self.block_send.subscribe();
+            let fut = futures_util::stream::unfold(recv, |mut f| async {
+                f.recv().await.ok().map(|i| (i, f))
+            });
+
+            Ok(Box::pin(fut))
         }
 
         async fn account_info(
@@ -91,7 +120,7 @@ pub(crate) mod tests {
         ) -> Result<AccountInfoReply, Status> {
             Ok(AccountInfoReply {
                 nonce: Default::default(),
-                balance: BALANCE.into(),
+                balance: Self::BALANCE.into(),
             })
         }
     }

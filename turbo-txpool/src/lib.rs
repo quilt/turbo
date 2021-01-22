@@ -509,9 +509,12 @@ mod tests {
 
     use super::*;
 
+    use turbo_proto::txpool::AccountInfo;
+
     fn inner() -> Inner<TestControl> {
+        let ctrl = TestControl::new();
         let cfg = Config::builder().max_txs(10).control(String::new()).build();
-        let mut out = Inner::with_config(TestControl, cfg);
+        let mut out = Inner::with_config(ctrl, cfg);
         out.latest_block = Some(Default::default());
         out
     }
@@ -560,7 +563,7 @@ mod tests {
             txs,
             by_hash,
             by_price,
-            control: TestControl,
+            control: TestControl::new(),
             max_txs: 2,
         };
 
@@ -603,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn qualify_fee_too_low() {
         let mut inner = Inner::with_config(
-            TestControl,
+            TestControl::new(),
             Config::builder().control("").max_txs(1).build(),
         );
         inner.latest_block = Some(Default::default());
@@ -632,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn insert_evict() {
         let mut inner = Inner::with_config(
-            TestControl,
+            TestControl::new(),
             Config::builder().control("").max_txs(1).build(),
         );
         inner.latest_block = Some(Default::default());
@@ -663,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn qualify_future_nonce() {
         let mut inner = Inner::with_config(
-            TestControl,
+            TestControl::new(),
             Config::builder().control("").max_txs(1).build(),
         );
         inner.latest_block = Some(Default::default());
@@ -687,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn qualify_insufficient_balance() {
         let mut inner = Inner::with_config(
-            TestControl,
+            TestControl::new(),
             Config::builder().control("").max_txs(1).build(),
         );
         inner.latest_block = Some(Default::default());
@@ -695,7 +698,7 @@ mod tests {
         let tx0 = Tx {
             gas_price: 1.into(),
             gas_limit: Default::default(),
-            nonce: 1,
+            nonce: 0,
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
@@ -706,5 +709,91 @@ mod tests {
 
         let q0 = inner.qualify(tx0).await.unwrap_err();
         assert_eq!(q0, ImportResult::Invalid);
+    }
+
+    #[tokio::test]
+    async fn applied_block_conflicts() {
+        let ctrl = TestControl::new();
+
+        let mut inner = Inner::with_config(
+            ctrl.clone(),
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let tx0 = vtx(100);
+        let inserted = inner.insert_transactions(vec![tx0.tx().clone()]).await;
+        assert_eq!(inserted, &[ImportResult::Success]);
+        assert_eq!(inner.txs.len(), 1);
+
+        let mut nonce = [0u8; 32];
+        U256::one().to_big_endian(&mut nonce);
+
+        let account = AccountInfo {
+            address: tx0.from().as_bytes().to_vec(),
+            balance: TestControl::BALANCE.to_vec(),
+            nonce: nonce.to_vec(),
+        };
+
+        let account_diff = AccountDiff {
+            diff: Some(account_diff::Diff::Changed(account)),
+        };
+
+        let applied = AppliedBlock {
+            hash: vec![0u8; 32],
+            parent_hash: vec![1u8; 32],
+            account_diffs: vec![account_diff],
+        };
+
+        let diff = BlockDiff {
+            diff: Some(block_diff::Diff::Applied(applied)),
+        };
+
+        inner.block_diff(diff).await;
+
+        assert!(inner.txs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn applied_block_no_conflicts() {
+        let ctrl = TestControl::new();
+
+        let mut inner = Inner::with_config(
+            ctrl.clone(),
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let tx0 = vtx(100);
+        let inserted = inner.insert_transactions(vec![tx0.tx().clone()]).await;
+        assert_eq!(inserted, &[ImportResult::Success]);
+        assert_eq!(inner.txs.len(), 1);
+
+        let mut nonce = [0u8; 32];
+        U256::one().to_big_endian(&mut nonce);
+
+        let account = AccountInfo {
+            address: vec![0u8; 20],
+            balance: TestControl::BALANCE.to_vec(),
+            nonce: nonce.to_vec(),
+        };
+
+        let account_diff = AccountDiff {
+            diff: Some(account_diff::Diff::Changed(account)),
+        };
+
+        let applied = AppliedBlock {
+            hash: vec![0u8; 32],
+            parent_hash: vec![1u8; 32],
+            account_diffs: vec![account_diff],
+        };
+
+        let diff = BlockDiff {
+            diff: Some(block_diff::Diff::Applied(applied)),
+        };
+
+        inner.block_diff(diff).await;
+
+        assert_eq!(inner.txs.len(), 1);
     }
 }
