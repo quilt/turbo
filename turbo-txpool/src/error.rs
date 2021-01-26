@@ -12,15 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Error types for the transaction pool.
+
 use snafu::{ResultExt, Snafu};
 
+/// The primary error type for the transaction pool.
 #[derive(Debug, Snafu)]
 #[snafu(visibility = "pub(crate)")]
+#[non_exhaustive]
 pub enum Error {
+    /// Decoding a structure from RLP failed.
     RlpDecode {
+        /// The preceding cause of the failure.
         source: rlp::DecoderError,
+
+        /// The field that failed to decode.
         field: Option<&'static str>,
     },
+
+    /// An integer was out of the range of the transaction pool's internal
+    /// representation.
     IntegerOverflow,
 }
 

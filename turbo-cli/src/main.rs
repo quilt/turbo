@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Testing harness for interacting with the `txpool` and `txpool_control` gRPC
+//! endpoints.
+
+#![deny(unsafe_code, missing_docs, missing_debug_implementations)]
+
 use hex::FromHex;
 
 use std::fmt;

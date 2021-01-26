@@ -12,10 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Configuration definition for the transaction pool. Can be deserialized, or
+//! built:
+//!
+//! ```rust
+//! use turbo_txpool::config::Config;
+//!
+//! let config = Config::builder()
+//!     .max_txs(1024)
+//!     .control("http://127.0.0.1:9092")
+//!     .build();
+//! ```
+
 use serde::{Deserialize, Serialize};
 
 use typed_builder::TypedBuilder;
 
+/// Configuration for the transaction pool. See the module documentation for an
+/// example.
 #[derive(Debug, TypedBuilder, Serialize, Deserialize)]
 pub struct Config {
     max_txs: usize,
@@ -25,10 +39,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// The maximum number of transactions to store in the pool at any time.
     pub fn max_txs(&self) -> usize {
         self.max_txs
     }
 
+    /// The URL of the `txpool_control` server.
     pub fn control(&self) -> &str {
         &self.control
     }
