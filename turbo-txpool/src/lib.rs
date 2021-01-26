@@ -1,3 +1,4 @@
+pub mod config;
 mod control;
 pub mod error;
 pub mod tx;
@@ -5,6 +6,7 @@ pub mod tx;
 #[cfg(feature = "arbitrary")]
 extern crate arbitrary_dep as arbitrary;
 
+use crate::config::Config;
 use crate::control::{Control, PbControl};
 use crate::error::Error;
 use crate::tx::{Tx, VerifiedTx};
@@ -36,8 +38,6 @@ use turbo_proto::txpool::{
     GetTransactionsRequest, ImportReply, ImportRequest, ImportResult,
     RevertedBlock, TxHashes,
 };
-
-use typed_builder::TypedBuilder;
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
 struct Priced {
@@ -97,9 +97,9 @@ impl<C> Inner<C> {
     pub fn with_config(control: C, config: Config) -> Self {
         Self {
             latest_block: None,
-            max_txs: config.max_txs,
-            txs: Slab::with_capacity(config.max_txs),
-            by_hash: HashMap::with_capacity(config.max_txs),
+            max_txs: config.max_txs(),
+            txs: Slab::with_capacity(config.max_txs()),
+            by_hash: HashMap::with_capacity(config.max_txs()),
             by_price: BTreeSet::new(),
             control,
         }
@@ -350,13 +350,6 @@ where
     }
 }
 
-#[derive(Debug, TypedBuilder)]
-pub struct Config {
-    max_txs: usize,
-    #[builder(setter(into))]
-    control: String,
-}
-
 pub struct TxPool {
     inner: Arc<RwLock<Inner<PbControl>>>,
     background: Option<JoinHandle<()>>,
@@ -367,7 +360,7 @@ impl TxPool {
         config: Config,
     ) -> Result<Self, tonic::transport::Error> {
         let client =
-            client::TxpoolControlClient::connect(config.control.clone())
+            client::TxpoolControlClient::connect(config.control().to_owned())
                 .await?;
         let control = PbControl::new(client);
         let mut stream_control = control.clone();

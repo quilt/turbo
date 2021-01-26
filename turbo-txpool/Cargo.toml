@@ -25,6 +25,7 @@ signature = { version = "1.2.2", default-features = false, features = [ "std" ] 
 async-trait = "0.1.42"
 futures-core = "0.3.9"
 futures-util = "0.3.9"
+serde = { version = "1.0.120", features = [ "derive" ] }
 
 [dependencies.arbitrary-dep]
 package ="arbitrary"

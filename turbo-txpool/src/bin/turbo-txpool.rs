@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 
-use turbo_txpool::{Config, TxPool};
+use turbo_txpool::config::Config;
+use turbo_txpool::TxPool;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), tonic::transport::Error> {
