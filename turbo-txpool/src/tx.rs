@@ -59,6 +59,10 @@ impl VerifiedTx {
         Ok(Self { hash, from, tx })
     }
 
+    pub fn gas_limit(&self) -> u64 {
+        self.tx.gas_limit
+    }
+
     pub fn gas_price(&self) -> &U256 {
         &self.tx.gas_price
     }
@@ -69,6 +73,18 @@ impl VerifiedTx {
 
     pub fn tx(&self) -> &Tx {
         &self.tx
+    }
+
+    pub fn from(&self) -> &Address {
+        &self.from
+    }
+
+    pub fn nonce(&self) -> u64 {
+        self.tx.nonce
+    }
+
+    pub fn value(&self) -> &U256 {
+        &self.tx.value
     }
 
     // TODO: Add getters as needed.
