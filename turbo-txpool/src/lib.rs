@@ -1,3 +1,23 @@
+// Copyright 2021 ConsenSys
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! An implementation of turbo-geth's transaction pool interfaces for the
+//! Ethereum network.
+
+#![deny(unsafe_code, missing_docs, missing_debug_implementations)]
+
+pub mod config;
 mod control;
 pub mod error;
 pub mod tx;
@@ -5,6 +25,7 @@ pub mod tx;
 #[cfg(feature = "arbitrary")]
 extern crate arbitrary_dep as arbitrary;
 
+use crate::config::Config;
 use crate::control::{Control, PbControl};
 use crate::error::Error;
 use crate::tx::{Tx, VerifiedTx};
@@ -36,8 +57,6 @@ use turbo_proto::txpool::{
     GetTransactionsRequest, ImportReply, ImportRequest, ImportResult,
     RevertedBlock, TxHashes,
 };
-
-use typed_builder::TypedBuilder;
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
 struct Priced {
@@ -97,9 +116,9 @@ impl<C> Inner<C> {
     pub fn with_config(control: C, config: Config) -> Self {
         Self {
             latest_block: None,
-            max_txs: config.max_txs,
-            txs: Slab::with_capacity(config.max_txs),
-            by_hash: HashMap::with_capacity(config.max_txs),
+            max_txs: config.max_txs(),
+            txs: Slab::with_capacity(config.max_txs()),
+            by_hash: HashMap::with_capacity(config.max_txs()),
             by_price: BTreeSet::new(),
             control,
         }
@@ -350,24 +369,39 @@ where
     }
 }
 
-#[derive(Debug, TypedBuilder)]
-pub struct Config {
-    max_txs: usize,
-    #[builder(setter(into))]
-    control: String,
-}
-
+/// An implementation of turbo-geth's transaction pool interfaces for the
+/// Ethereum network.
+///
+/// # Example
+///
+/// ```no_run
+/// use turbo_txpool::TxPool;
+/// use turbo_txpool::config::Config;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = Config::builder()
+///     .max_txs(1024)
+///     .control("http://127.0.0.1:9092")
+///     .build();
+///
+/// let pool = TxPool::with_config(config).await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
 pub struct TxPool {
     inner: Arc<RwLock<Inner<PbControl>>>,
     background: Option<JoinHandle<()>>,
 }
 
 impl TxPool {
+    /// Construct a new `TxPool` instance with the given configuration.
     pub async fn with_config(
         config: Config,
     ) -> Result<Self, tonic::transport::Error> {
         let client =
-            client::TxpoolControlClient::connect(config.control.clone())
+            client::TxpoolControlClient::connect(config.control().to_owned())
                 .await?;
         let control = PbControl::new(client);
         let mut stream_control = control.clone();
@@ -397,6 +431,7 @@ impl TxPool {
         })
     }
 
+    /// Begin servicing requests, binding to `addr`.
     pub async fn run<I>(
         mut self,
         addr: I,
@@ -419,6 +454,8 @@ impl TxPool {
         }
     }
 
+    /// Given a list of transaction hashes, return the ones unknown to this
+    /// transaction pool.
     pub async fn find_unknown_transactions(
         &self,
         request: Request<TxHashes>,
@@ -426,6 +463,7 @@ impl TxPool {
         self.inner.read().await.find_unknown_transactions(request)
     }
 
+    /// Insert the given transactions `txs` into this transaction pool.
     pub async fn insert_transactions(
         &mut self,
         txs: Vec<Tx>,
@@ -433,6 +471,8 @@ impl TxPool {
         self.inner.write().await.insert_transactions(txs).await
     }
 
+    /// Decode the given transactions, and insert them into this transaction
+    /// pool.
     pub async fn import_transactions(
         &self,
         request: Request<ImportRequest>,
@@ -440,6 +480,7 @@ impl TxPool {
         self.inner.write().await.import_transactions(request).await
     }
 
+    /// Given a set of transaction hashes, return the full transaction details.
     pub async fn get_transactions(
         &self,
         request: Request<GetTransactionsRequest>,

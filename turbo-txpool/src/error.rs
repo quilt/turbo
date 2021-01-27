@@ -1,12 +1,37 @@
+// Copyright 2021 ConsenSys
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Error types for the transaction pool.
+
 use snafu::{ResultExt, Snafu};
 
+/// The primary error type for the transaction pool.
 #[derive(Debug, Snafu)]
 #[snafu(visibility = "pub(crate)")]
+#[non_exhaustive]
 pub enum Error {
+    /// Decoding a structure from RLP failed.
     RlpDecode {
+        /// The preceding cause of the failure.
         source: rlp::DecoderError,
+
+        /// The field that failed to decode.
         field: Option<&'static str>,
     },
+
+    /// An integer was out of the range of the transaction pool's internal
+    /// representation.
     IntegerOverflow,
 }
 

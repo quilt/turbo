@@ -3,6 +3,7 @@ name = "turbo-txpool"
 version = "0.1.0"
 authors = ["Sam Wilson <sam.wilson@mesh.xyz>"]
 edition = "2018"
+license = "Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -25,6 +26,9 @@ signature = { version = "1.2.2", default-features = false, features = [ "std" ] 
 async-trait = "0.1.42"
 futures-core = "0.3.9"
 futures-util = "0.3.9"
+serde = { version = "1.0.120", features = [ "derive" ] }
+structopt = "0.3.21"
+toml = "0.5.8"
 
 [dependencies.arbitrary-dep]
 package ="arbitrary"
