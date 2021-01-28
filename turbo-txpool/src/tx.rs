@@ -14,7 +14,7 @@
 
 //! Transactions as understood by the transaction pool.
 
-use crate::error::{Error, RlpResultExt};
+use crate::error::decode_error::{DecodeError, RlpResultExt};
 
 use ethereum_types::{Address, H256, U256};
 
@@ -224,15 +224,18 @@ impl Tx {
         stream.append(&self.s);
     }
 
-    pub(crate) fn decode(stream: &rlp::Rlp) -> Result<Self, Error> {
+    pub(crate) fn decode(stream: &rlp::Rlp) -> Result<Self, DecodeError> {
         let to = {
             let field = stream.at(3).context_field("to")?;
             if field.is_empty() {
                 if field.is_data() {
                     None
                 } else {
-                    return Err(Error::RlpDecode {
-                        source: rlp::DecoderError::RlpExpectedToBeData,
+                    return Err(DecodeError::RlpDecode {
+                        source: Box::new(
+                            rlp::DecoderError::RlpExpectedToBeData,
+                        )
+                        .into(),
                         field: Some("to"),
                     });
                 }
@@ -247,7 +250,7 @@ impl Tx {
 
         let nonce = match stream.val_at::<U256>(0).context_field("nonce")? {
             x if x > u64::max_value().into() => {
-                return Err(Error::IntegerOverflow);
+                return Err(DecodeError::IntegerOverflow);
             }
             x => x.as_u64(),
         };
@@ -255,7 +258,7 @@ impl Tx {
         let gas_limit =
             match stream.val_at::<U256>(2).context_field("gas_limit")? {
                 x if x > u64::max_value().into() => {
-                    return Err(Error::IntegerOverflow);
+                    return Err(DecodeError::IntegerOverflow);
                 }
                 x => x.as_u64(),
             };
@@ -365,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn decode() -> Result<(), Error> {
+    fn decode() -> Result<(), DecodeError> {
         let txbytes = hex!(
             "
             f8658001887fffffffffffffff94095e7baea6a6c7c4c2dfeb977efac326af552d
@@ -416,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_1000000() -> Result<(), Error> {
+    fn decode_1000000() -> Result<(), DecodeError> {
         let txbytes = hex!(
             "
             f86e158512bfb19e608301f8dc94c083e9947cf02b8ffc7d3090ae9aea72df98fd

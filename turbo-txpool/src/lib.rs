@@ -27,12 +27,14 @@ extern crate arbitrary_dep as arbitrary;
 
 use crate::config::Config;
 use crate::control::{Control, PbControl};
-use crate::error::Error;
+use crate::error::{import_error, ImportError};
 use crate::tx::{Tx, VerifiedTx};
 
 use ethereum_types::{Address, H256, U256};
 
 use slab::Slab;
+
+use snafu::{ensure, OptionExt, ResultExt};
 
 use std::collections::{hash_map, BTreeSet, HashMap};
 use std::future::Future;
@@ -143,10 +145,14 @@ impl<C> Inner<C> {
         Ok(Response::new(GetTransactionsReply { txs }))
     }
 
-    fn insert(&mut self, verified: VerifiedTx) -> ImportResult {
+    fn insert(&mut self, verified: VerifiedTx) -> Result<(), ImportError> {
         let by_hash = match self.by_hash.entry(*verified.hash()) {
             hash_map::Entry::Vacant(v) => v,
-            hash_map::Entry::Occupied(_) => return ImportResult::AlreadyExists,
+            hash_map::Entry::Occupied(_) => {
+                return Err(ImportError::AlreadyExists {
+                    txhash: *verified.hash(),
+                })
+            }
         };
 
         let gas_price = *verified.gas_price();
@@ -161,7 +167,7 @@ impl<C> Inner<C> {
             self.remove(self.cheapest_key().unwrap());
         }
 
-        ImportResult::Success
+        Ok(())
     }
 }
 
@@ -245,28 +251,22 @@ where
         }
     }
 
-    async fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
-        let latest_block = match self.latest_block {
-            Some(b) => b,
-            None => {
-                return Err(ImportResult::InternalError);
-            }
-        };
+    async fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportError> {
+        let latest_block = self.latest_block.context(import_error::NotReady)?;
 
         if self.txs.len() >= self.max_txs {
             let cheapest =
                 self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
-            if tx.gas_price <= cheapest {
-                return Err(ImportResult::FeeTooLow);
-            }
+
+            ensure!(
+                tx.gas_price > cheapest,
+                import_error::FeeTooLow { minimum: cheapest },
+            );
         }
 
-        let verified = match VerifiedTx::new(tx) {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(ImportResult::Invalid);
-            }
-        };
+        let verified = VerifiedTx::new(tx)
+            .map_err(|e| Box::new(e).into())
+            .context(import_error::Ecdsa)?;
 
         let req = AccountInfoRequest {
             account: verified.from().as_bytes().to_owned(),
@@ -277,7 +277,7 @@ where
         let account = control
             .account_info(req)
             .await
-            .map_err(|_| ImportResult::InternalError)?;
+            .context(import_error::RequestFailed)?;
 
         let nonce = U256::from_big_endian(&account.nonce);
         let balance = U256::from_big_endian(&account.balance);
@@ -290,17 +290,23 @@ where
         verified: &VerifiedTx,
         nonce: U256,
         balance: U256,
-    ) -> Result<(), ImportResult> {
-        if U256::from(verified.nonce()) != nonce {
-            return Err(ImportResult::Invalid);
-        }
+    ) -> Result<(), ImportError> {
+        ensure!(
+            U256::from(verified.nonce()) == nonce,
+            import_error::InvalidNonce {
+                txhash: *verified.hash(),
+            }
+        );
 
         let required =
             (verified.gas_price() * verified.gas_limit()) + verified.value();
 
-        if balance < required {
-            return Err(ImportResult::Invalid);
-        }
+        ensure!(
+            balance >= required,
+            import_error::InsufficientBalance {
+                txhash: *verified.hash(),
+            }
+        );
 
         Ok(())
     }
@@ -316,9 +322,9 @@ where
 
         let mut result = Vec::with_capacity(verified.len());
         for res in verified.into_iter() {
-            let ins = match res {
-                Ok(vx) => self.insert(vx),
-                Err(e) => e,
+            let ins = match res.and_then(|vx| self.insert(vx)) {
+                Ok(()) => ImportResult::Success,
+                Err(e) => e.into(),
             };
             result.push(ins);
         }
@@ -342,15 +348,7 @@ where
         let qualifiers = request.txs.into_iter().map(|b| {
             let decoded = Tx::decode(&rlp::Rlp::new(&b));
 
-            async {
-                match decoded {
-                    Ok(tx) => self.qualify(tx).await,
-                    Err(Error::RlpDecode { .. }) => Err(ImportResult::Invalid),
-                    Err(Error::IntegerOverflow) => {
-                        Err(ImportResult::InternalError)
-                    }
-                }
-            }
+            async { self.qualify(decoded?).await }
         });
 
         let txs = futures_util::future::join_all(qualifiers).await;
@@ -358,10 +356,11 @@ where
         let mut imported = Vec::with_capacity(txs.len());
 
         for tx in txs.into_iter() {
-            let result = match tx {
-                Ok(tx) => self.insert(tx),
-                Err(e) => e,
+            let result = match tx.and_then(|tx| self.insert(tx)) {
+                Ok(()) => ImportResult::Success,
+                Err(e) => e.into(),
             };
+
             imported.push(result as i32);
         }
 
@@ -619,12 +618,10 @@ mod tests {
         let tx1 = vtx(101);
 
         let q0 = inner.qualify(tx0.tx().clone()).await.unwrap();
-        let result = inner.insert(q0);
-        assert_eq!(result, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let q1 = inner.qualify(tx1.tx().clone()).await.unwrap();
-        let result2 = inner.insert(q1);
-        assert_eq!(result2, ImportResult::Success);
+        inner.insert(q1).unwrap();
 
         assert_eq!(inner.txs.len(), 2);
         assert_eq!(inner.by_hash.len(), 2);
@@ -653,11 +650,10 @@ mod tests {
         inner.latest_block = Some(Default::default());
 
         let q0 = inner.qualify(tx(100)).await.unwrap();
-        let r0 = inner.insert(q0);
-        assert_eq!(r0, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let r1 = inner.qualify(tx(99)).await.unwrap_err();
-        assert_eq!(r1, ImportResult::FeeTooLow);
+        assert!(matches!(r1, ImportError::FeeTooLow { .. }));
     }
 
     #[tokio::test]
@@ -665,12 +661,11 @@ mod tests {
         let mut inner = inner();
 
         let q0 = inner.qualify(tx(100)).await.unwrap();
-        let r0 = inner.insert(q0);
-        assert_eq!(r0, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let q1 = inner.qualify(tx(100)).await.unwrap();
-        let r1 = inner.insert(q1);
-        assert_eq!(r1, ImportResult::AlreadyExists);
+        let r1 = inner.insert(q1).unwrap_err();
+        assert!(matches!(r1, ImportError::AlreadyExists { .. }));
     }
 
     #[tokio::test]
@@ -683,13 +678,11 @@ mod tests {
 
         let tx0 = tx(99);
         let q0 = inner.qualify(tx0).await.unwrap();
-        let r0 = inner.insert(q0);
-        assert_eq!(r0, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let tx1 = vtx(100);
         let q1 = inner.qualify(tx1.tx().clone()).await.unwrap();
-        let r1 = inner.insert(q1);
-        assert_eq!(r1, ImportResult::Success);
+        inner.insert(q1).unwrap();
 
         assert_eq!(inner.txs.len(), 1);
         assert_eq!(inner.by_hash.len(), 1);
@@ -725,7 +718,7 @@ mod tests {
         };
 
         let q0 = inner.qualify(tx0).await.unwrap_err();
-        assert_eq!(q0, ImportResult::Invalid);
+        assert!(matches!(q0, ImportError::InvalidNonce { .. }));
     }
 
     #[tokio::test]
@@ -749,7 +742,7 @@ mod tests {
         };
 
         let q0 = inner.qualify(tx0).await.unwrap_err();
-        assert_eq!(q0, ImportResult::Invalid);
+        assert!(matches!(q0, ImportError::InsufficientBalance { .. }));
     }
 
     #[tokio::test]
