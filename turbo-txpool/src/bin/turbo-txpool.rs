@@ -22,6 +22,8 @@ use std::path::PathBuf;
 
 use structopt::StructOpt;
 
+use tracing_subscriber::EnvFilter;
+
 use turbo_txpool::config::Config;
 use turbo_txpool::TxPool;
 
@@ -45,8 +47,12 @@ struct Opt {
     config: PathBuf,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<(), Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
     let opt = Opt::from_args();
     let config_bytes = fs::read(&opt.config).context(Io)?;
     let tonic_config: TonicConfig =

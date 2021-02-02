@@ -60,7 +60,7 @@ pub(crate) mod decode_error {
 }
 
 pub(crate) mod import_error {
-    use ethereum_types::{H256, U256};
+    use ethereum_types::{Address, H256, U256};
 
     use snafu::Snafu;
 
@@ -71,18 +71,33 @@ pub(crate) mod import_error {
     #[non_exhaustive]
     #[snafu(visibility = "pub(crate)")]
     pub enum ImportError {
-        /// The nonce provided with the transaction is in the past, or too far
-        /// in the future.
-        InvalidNonce {
+        /// The nonce provided with the transaction has already been used.
+        NonceUsed {
             /// The offending transaction hash.
-            txhash: H256,
+            tx_hash: H256,
+        },
+
+        /// The nonce provided with the transaction is too far in the future.
+        #[snafu(display(
+            "nonce is too far in the future tx_nonce={} from={} tx={}",
+            from,
+            tx_nonce,
+            tx_hash,
+        ))]
+        NonceGap {
+            /// Account that signed the transaction
+            from: Address,
+            /// The transaction's nonce.
+            tx_nonce: u64,
+            /// The offending transaction hash.
+            tx_hash: H256,
         },
 
         /// The account's balance is insufficient to cover the gas fees and/or
         /// value sent with the transaction.
         InsufficientBalance {
             /// The offending transaction hash.
-            txhash: H256,
+            tx_hash: H256,
         },
 
         /// The transaction pool has not yet received a block from the control
@@ -112,7 +127,7 @@ pub(crate) mod import_error {
         /// The transaction already exists in the pool.
         AlreadyExists {
             /// The offending transaction hash.
-            txhash: H256,
+            tx_hash: H256,
         },
 
         /// Request to backend failed.
@@ -125,7 +140,8 @@ pub(crate) mod import_error {
     impl From<ImportError> for ImportResult {
         fn from(e: ImportError) -> ImportResult {
             match e {
-                ImportError::InvalidNonce { .. } => ImportResult::Invalid,
+                ImportError::NonceGap { .. } => ImportResult::Invalid,
+                ImportError::NonceUsed { .. } => ImportResult::Invalid,
                 ImportError::FeeTooLow { .. } => ImportResult::FeeTooLow,
                 ImportError::NotReady => ImportResult::InternalError,
                 ImportError::Ecdsa { .. } => ImportResult::Invalid,

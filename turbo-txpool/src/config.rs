@@ -32,6 +32,8 @@ use typed_builder::TypedBuilder;
 /// example.
 #[derive(Debug, TypedBuilder, Serialize, Deserialize)]
 pub struct Config {
+    #[builder(default = Config::default_max_txs())]
+    #[serde(default = "Config::default_max_txs")]
     max_txs: usize,
 
     #[builder(setter(into))]
@@ -39,6 +41,10 @@ pub struct Config {
 }
 
 impl Config {
+    fn default_max_txs() -> usize {
+        1024
+    }
+
     /// The maximum number of transactions to store in the pool at any time.
     pub fn max_txs(&self) -> usize {
         self.max_txs

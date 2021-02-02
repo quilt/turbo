@@ -15,12 +15,15 @@
 //! Transactions as understood by the transaction pool.
 
 use crate::error::decode_error::{DecodeError, RlpResultExt};
+use crate::error::import_error::{self, ImportError};
 
 use ethereum_types::{Address, H256, U256};
 
 pub use k256::ecdsa::Error as EcdsaError;
 use k256::ecdsa::{self, recoverable};
 use k256::EncodedPoint;
+
+use snafu::ensure;
 
 use std::convert::{TryFrom, TryInto};
 
@@ -104,6 +107,27 @@ impl VerifiedTx {
     }
 
     // TODO: Add getters as needed.
+
+    pub fn is_runnable(
+        &self,
+        account_nonce: U256,
+        balance: U256,
+    ) -> Result<bool, ImportError> {
+        let verified_nonce = U256::from(self.nonce());
+        ensure!(
+            verified_nonce >= account_nonce,
+            import_error::NonceUsed { tx_hash: self.hash }
+        );
+
+        let required = (self.tx.gas_price * self.tx.gas_limit) + self.tx.value;
+
+        ensure!(
+            balance >= required,
+            import_error::InsufficientBalance { tx_hash: self.hash }
+        );
+
+        Ok(verified_nonce == account_nonce)
+    }
 }
 
 impl TryFrom<Tx> for VerifiedTx {
