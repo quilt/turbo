@@ -48,10 +48,8 @@ pub(crate) struct VerifiedTx {
 impl VerifiedTx {
     pub fn new(tx: Tx) -> Result<Self, EcdsaError> {
         let v = 1 - (tx.v % 2);
-        let mut r = [0u8; 32];
-        tx.r.to_big_endian(&mut r);
-        let mut s = [0u8; 32];
-        tx.s.to_big_endian(&mut s);
+        let r = tx.r.to_fixed_bytes();
+        let s = tx.s.to_fixed_bytes();
 
         let sig = recoverable::Signature::new(
             &ecdsa::Signature::from_scalars(r, s)?,
@@ -175,10 +173,10 @@ pub struct Tx {
     pub v: u64,
 
     /// The `r` component of the transaction signature.
-    pub r: U256,
+    pub r: H256,
 
     /// The `s` component of the transaction signature.
-    pub s: U256,
+    pub s: H256,
 }
 
 impl Tx {
@@ -333,13 +331,13 @@ mod tests {
             "
         );
 
-        let r = U256::from(hex!(
+        let r = H256::from(hex!(
             "
             241881bc2b3c3fd940aaec9de425409d63f1c2101aae76dc1ff6747d8998f3e6
             "
         ));
 
-        let s = U256::from(hex!(
+        let s = H256::from(hex!(
             "
             5fed35536db8a9c90c1d1e3a9d8b6669d4d3b0722228e38e6f6cc571272ed0ab
             "
@@ -403,7 +401,7 @@ mod tests {
         );
 
         let tx = Tx::decode(&rlp::Rlp::new(&txbytes))?;
-        assert_eq!(tx.input, &[]);
+        assert_eq!(tx.input, &[] as &[u8]);
         assert_eq!(tx.gas_limit, 0x7fffffffffffffff);
         assert_eq!(tx.gas_price, 1.into());
         assert_eq!(tx.nonce, 0);
@@ -454,7 +452,7 @@ mod tests {
         );
 
         let tx = Tx::decode(&rlp::Rlp::new(&txbytes))?;
-        assert_eq!(tx.input, &[]);
+        assert_eq!(tx.input, &[] as &[u8]);
         assert_eq!(tx.gas_limit, 129244);
         assert_eq!(tx.gas_price, 80525500000u64.into());
         assert_eq!(tx.nonce, 21);

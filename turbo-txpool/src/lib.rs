@@ -395,11 +395,54 @@ where
                 None => return true,
             };
 
+            let priced = Priced {
+                key,
+                gas_price: *ptx.tx.gas_price(),
+            };
+
+            let nonced = Nonced {
+                key,
+                nonce: ptx.tx.nonce(),
+            };
+
             match ptx.tx.is_runnable(account.nonce, account.balance) {
-                Ok(_) => {
-                    // TODO: Move newly runnable transactions from `soon` to
-                    // `by_price`
-                    return true;
+                Ok(runnable) => {
+                    match (ptx.runnable, runnable) {
+                        (true, false) => {
+                            // Tx was runnable, now isn't.
+                            debug!(
+                                "Transaction unreadied from={} nonce={} price={} hash={}",
+                                ptx.tx.from(),
+                                ptx.tx.nonce(),
+                                ptx.tx.gas_price(),
+                                ptx.tx.hash(),
+                            );
+
+                            let removed = by_price.remove(&priced);
+                            assert!(removed);
+
+                            let inserted = soon.entry(*ptx.tx.from()).or_default().insert(nonced);
+                            assert!(inserted);
+                        },
+                        (false, true) => {
+                            // Tx was not runnable, now is.
+                            debug!(
+                                "Transaction readied from={} nonce={} price={} hash={}",
+                                ptx.tx.from(),
+                                ptx.tx.nonce(),
+                                ptx.tx.gas_price(),
+                                ptx.tx.hash(),
+                            );
+                            let removed = Self::remove_soon(soon, *ptx.tx.from(), &nonced);
+                            assert!(removed);
+
+                            let inserted = by_price.insert(priced);
+                            assert!(inserted);
+                        },
+                        _ => (),
+                    }
+
+                    true
                 }
                 Err(e) => {
                     debug!(
@@ -410,21 +453,12 @@ where
                         ptx.tx.hash(),
                         e
                     );
+
+                    by_price.remove(&priced);
+                    Self::remove_soon(soon, *ptx.tx.from(), &nonced);
+                    false
                 },
             }
-
-            by_price.remove(&Priced {
-                key,
-                gas_price: *ptx.tx.gas_price(),
-            });
-
-            let nonced = Nonced {
-                key,
-                nonce: ptx.tx.nonce(),
-            };
-            Self::remove_soon(soon, *ptx.tx.from(), &nonced);
-
-            false
         });
     }
 
@@ -749,11 +783,51 @@ impl server::Txpool for TxPool {
 mod tests {
     use crate::control::tests::TestControl;
 
+    use ethers_core::types::{NameOrAddress, TransactionRequest};
+
+    use ethers_signers::{LocalWallet, Signer};
+
     use std::convert::TryInto;
 
     use super::*;
 
     use turbo_proto::txpool::AccountInfo;
+
+    #[async_trait::async_trait]
+    trait Sign {
+        async fn sign_with(self, idx: usize) -> Tx;
+    }
+
+    #[async_trait::async_trait]
+    impl Sign for TransactionRequest {
+        async fn sign_with(self, idx: usize) -> Tx {
+            let sig = wallet(idx).sign_transaction(&self).await.unwrap();
+            let to = match self.to {
+                Some(NameOrAddress::Address(to)) => Some(to),
+                Some(NameOrAddress::Name(_)) => panic!("address only"),
+                None => None,
+            };
+
+            Tx {
+                to,
+                value: self.value.unwrap_or_default(),
+                gas_limit: self.gas.unwrap().as_u64(),
+                gas_price: self.gas_price.unwrap(),
+                input: self.data.map(|x| x.to_vec()).unwrap_or_default(),
+                nonce: self.nonce.unwrap().as_u64(),
+                v: sig.v,
+                r: sig.r,
+                s: sig.s,
+            }
+        }
+    }
+
+    const KEYS: &[&str] =
+        &["dcf2cbdd171a21c480aa7f53d77f31bb102282b3ff099c78e3118b37348c72f7"];
+
+    fn wallet(idx: usize) -> LocalWallet {
+        KEYS[idx].parse().unwrap()
+    }
 
     fn inner() -> Inner<TestControl> {
         let ctrl = TestControl::new();
@@ -782,8 +856,8 @@ mod tests {
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: 1.into(),
-            s: 1.into(),
+            r: H256::from_low_u64_le(1),
+            s: H256::from_low_u64_le(1),
             value: Default::default(),
         }
         .into()
@@ -924,8 +998,8 @@ mod tests {
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: 1.into(),
-            s: 1.into(),
+            r: H256::from_low_u64_le(1),
+            s: H256::from_low_u64_le(1),
             value: Default::default(),
         };
 
@@ -949,8 +1023,8 @@ mod tests {
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: 1.into(),
-            s: 1.into(),
+            r: H256::from_low_u64_le(1),
+            s: H256::from_low_u64_le(1),
             value: 0xFFFFFFFFFFFFFFFFFu128.into(),
         };
 
@@ -1137,5 +1211,50 @@ mod tests {
         assert!(inner.by_price.is_empty());
     }
 
-    // TODO: Test multiple soon transactions from the same account
+    #[tokio::test]
+    async fn insert_two_from_same_account() {
+        let mut inner = Inner::with_config(
+            TestControl::new(),
+            Config::builder().control("").build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let tx0 = TransactionRequest::new()
+            .to(Address::default())
+            .nonce(0)
+            .value(1)
+            .gas(21000)
+            .gas_price(1)
+            .sign_with(0)
+            .await;
+
+        let tx1 = TransactionRequest::new()
+            .to(Address::default())
+            .nonce(1)
+            .value(1)
+            .gas(21000)
+            .gas_price(100)
+            .sign_with(0)
+            .await;
+
+        let res = inner
+            .insert_transactions(vec![tx1.clone(), tx0.clone()])
+            .await;
+        assert_eq!(res, [ImportResult::Success, ImportResult::Success]);
+
+        assert_eq!(inner.txs.len(), 2);
+        assert_eq!(inner.txs[0].runnable, false);
+        assert_eq!(inner.txs[0].tx.tx(), &tx1);
+        assert_eq!(inner.txs[1].runnable, true);
+        assert_eq!(inner.txs[1].tx.tx(), &tx0);
+
+        assert_eq!(inner.soon.len(), 1);
+        let soon_set = &inner.soon[&wallet(0).address()];
+        assert_eq!(soon_set.len(), 1);
+        let soon = soon_set.iter().next().unwrap();
+        assert_eq!(soon.key, 0);
+        assert_eq!(soon.nonce, 1);
+
+        assert_eq!(inner.by_price.len(), 1);
+    }
 }
