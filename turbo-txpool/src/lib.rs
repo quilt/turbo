@@ -1,4 +1,4 @@
-// Copyright 2021 ConsenSys
+// Copyright 2020 ConsenSys
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,10 +57,9 @@ use turbo_proto::txpool::block_stream_request::StartWith;
 use turbo_proto::txpool::txpool_control_client as client;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
-    account_diff, block_diff, AccountDiff, AccountInfoRequest, AppliedBlock,
-    BlockDiff, BlockStreamRequest, GetTransactionsReply,
-    GetTransactionsRequest, ImportReply, ImportRequest, ImportResult,
-    RevertedBlock, TxHashes,
+    block_diff, AccountInfo, AccountInfoRequest, AppliedBlock, BlockDiff,
+    BlockStreamRequest, GetTransactionsReply, GetTransactionsRequest,
+    ImportReply, ImportRequest, ImportResult, RevertedBlock, TxHashes,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -356,31 +355,19 @@ impl<C> Inner<C>
 where
     C: Clone + Control,
 {
-    fn recheck(&mut self, diffs: &[AccountDiff]) {
+    fn recheck(&mut self, account_infos: &[AccountInfo]) {
         #[derive(Default)]
         struct Account {
             balance: U256,
             nonce: U256,
         }
 
-        let mut accounts = HashMap::with_capacity(diffs.len());
-        for diff in diffs {
-            let account;
-            let address;
-
-            match &diff.diff {
-                Some(account_diff::Diff::Deleted(addr)) => {
-                    account = Account::default();
-                    address = Address::from_slice(&addr);
-                }
-                Some(account_diff::Diff::Changed(delta)) => {
-                    address = Address::from_slice(&delta.address);
-                    account = Account {
-                        balance: U256::from_big_endian(&delta.balance),
-                        nonce: U256::from_big_endian(&delta.nonce),
-                    };
-                }
-                None => continue,
+        let mut accounts = HashMap::with_capacity(account_infos.len());
+        for account_info in account_infos {
+            let address = Address::from_slice(&account_info.address);
+            let account = Account {
+                balance: U256::from_big_endian(&account_info.balance),
+                nonce: U256::from_big_endian(&account_info.nonce),
             };
 
             accounts.insert(address, account);
@@ -471,7 +458,7 @@ where
 
         info!("block reverted latest_block={}", self.latest_block.unwrap(),);
 
-        self.recheck(&block.new_state);
+        self.recheck(&block.reverted_accounts);
         self.import_transactions_request(req).await.ok();
     }
 
@@ -481,7 +468,7 @@ where
         self.latest_block = Some(hash);
         info!("block applied latest_block={}", self.latest_block.unwrap(),);
 
-        self.recheck(&block.account_diffs);
+        self.recheck(&block.changed_accounts);
     }
 
     async fn block_diff(&mut self, block_diff: BlockDiff) {
@@ -1056,14 +1043,10 @@ mod tests {
             nonce: nonce.to_vec(),
         };
 
-        let account_diff = AccountDiff {
-            diff: Some(account_diff::Diff::Changed(account)),
-        };
-
         let applied = AppliedBlock {
             hash: vec![0u8; 32],
             parent_hash: vec![1u8; 32],
-            account_diffs: vec![account_diff],
+            changed_accounts: vec![account],
         };
 
         let diff = BlockDiff {
@@ -1099,14 +1082,10 @@ mod tests {
             nonce: nonce.to_vec(),
         };
 
-        let account_diff = AccountDiff {
-            diff: Some(account_diff::Diff::Changed(account)),
-        };
-
         let applied = AppliedBlock {
             hash: vec![0u8; 32],
             parent_hash: vec![1u8; 32],
-            account_diffs: vec![account_diff],
+            changed_accounts: vec![account],
         };
 
         let diff = BlockDiff {
@@ -1134,10 +1113,13 @@ mod tests {
         assert_eq!(inserted, [ImportResult::Success]);
 
         assert_eq!(inner.txs.len(), 1);
-        assert!(matches!(inner.txs[0], PooledTx {
-            runnable: false,
-            ..
-        }));
+        assert!(matches!(
+            inner.txs[0],
+            PooledTx {
+                runnable: false,
+                ..
+            }
+        ));
 
         let soon = &inner.soon[vtx0.from()];
         assert_eq!(soon.len(), 1);
