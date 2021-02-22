@@ -14,13 +14,16 @@
 
 //! Transactions as understood by the transaction pool.
 
-use crate::error::{Error, RlpResultExt};
+use crate::error::decode_error::{DecodeError, RlpResultExt};
+use crate::error::import_error::{self, ImportError};
 
 use ethereum_types::{Address, H256, U256};
 
 pub use k256::ecdsa::Error as EcdsaError;
 use k256::ecdsa::{self, recoverable};
 use k256::EncodedPoint;
+
+use snafu::ensure;
 
 use std::convert::{TryFrom, TryInto};
 
@@ -45,10 +48,8 @@ pub(crate) struct VerifiedTx {
 impl VerifiedTx {
     pub fn new(tx: Tx) -> Result<Self, EcdsaError> {
         let v = 1 - (tx.v % 2);
-        let mut r = [0u8; 32];
-        tx.r.to_big_endian(&mut r);
-        let mut s = [0u8; 32];
-        tx.s.to_big_endian(&mut s);
+        let r = tx.r.to_fixed_bytes();
+        let s = tx.s.to_fixed_bytes();
 
         let sig = recoverable::Signature::new(
             &ecdsa::Signature::from_scalars(r, s)?,
@@ -75,10 +76,6 @@ impl VerifiedTx {
         Ok(Self { hash, from, tx })
     }
 
-    pub fn gas_limit(&self) -> u64 {
-        self.tx.gas_limit
-    }
-
     pub fn gas_price(&self) -> &U256 {
         &self.tx.gas_price
     }
@@ -99,11 +96,28 @@ impl VerifiedTx {
         self.tx.nonce
     }
 
-    pub fn value(&self) -> &U256 {
-        &self.tx.value
-    }
-
     // TODO: Add getters as needed.
+
+    pub fn is_runnable(
+        &self,
+        account_nonce: U256,
+        balance: U256,
+    ) -> Result<bool, ImportError> {
+        let verified_nonce = U256::from(self.nonce());
+        ensure!(
+            verified_nonce >= account_nonce,
+            import_error::NonceUsed { tx_hash: self.hash }
+        );
+
+        let required = (self.tx.gas_price * self.tx.gas_limit) + self.tx.value;
+
+        ensure!(
+            balance >= required,
+            import_error::InsufficientBalance { tx_hash: self.hash }
+        );
+
+        Ok(verified_nonce == account_nonce)
+    }
 }
 
 impl TryFrom<Tx> for VerifiedTx {
@@ -151,10 +165,10 @@ pub struct Tx {
     pub v: u64,
 
     /// The `r` component of the transaction signature.
-    pub r: U256,
+    pub r: H256,
 
     /// The `s` component of the transaction signature.
-    pub s: U256,
+    pub s: H256,
 }
 
 impl Tx {
@@ -224,15 +238,18 @@ impl Tx {
         stream.append(&self.s);
     }
 
-    pub(crate) fn decode(stream: &rlp::Rlp) -> Result<Self, Error> {
+    pub(crate) fn decode(stream: &rlp::Rlp) -> Result<Self, DecodeError> {
         let to = {
             let field = stream.at(3).context_field("to")?;
             if field.is_empty() {
                 if field.is_data() {
                     None
                 } else {
-                    return Err(Error::RlpDecode {
-                        source: rlp::DecoderError::RlpExpectedToBeData,
+                    return Err(DecodeError::RlpDecode {
+                        source: Box::new(
+                            rlp::DecoderError::RlpExpectedToBeData,
+                        )
+                        .into(),
                         field: Some("to"),
                     });
                 }
@@ -247,7 +264,7 @@ impl Tx {
 
         let nonce = match stream.val_at::<U256>(0).context_field("nonce")? {
             x if x > u64::max_value().into() => {
-                return Err(Error::IntegerOverflow);
+                return Err(DecodeError::IntegerOverflow);
             }
             x => x.as_u64(),
         };
@@ -255,7 +272,7 @@ impl Tx {
         let gas_limit =
             match stream.val_at::<U256>(2).context_field("gas_limit")? {
                 x if x > u64::max_value().into() => {
-                    return Err(Error::IntegerOverflow);
+                    return Err(DecodeError::IntegerOverflow);
                 }
                 x => x.as_u64(),
             };
@@ -306,13 +323,13 @@ mod tests {
             "
         );
 
-        let r = U256::from(hex!(
+        let r = H256::from(hex!(
             "
             241881bc2b3c3fd940aaec9de425409d63f1c2101aae76dc1ff6747d8998f3e6
             "
         ));
 
-        let s = U256::from(hex!(
+        let s = H256::from(hex!(
             "
             5fed35536db8a9c90c1d1e3a9d8b6669d4d3b0722228e38e6f6cc571272ed0ab
             "
@@ -365,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn decode() -> Result<(), Error> {
+    fn decode() -> Result<(), DecodeError> {
         let txbytes = hex!(
             "
             f8658001887fffffffffffffff94095e7baea6a6c7c4c2dfeb977efac326af552d
@@ -376,7 +393,7 @@ mod tests {
         );
 
         let tx = Tx::decode(&rlp::Rlp::new(&txbytes))?;
-        assert_eq!(tx.input, &[]);
+        assert_eq!(tx.input, &[] as &[u8]);
         assert_eq!(tx.gas_limit, 0x7fffffffffffffff);
         assert_eq!(tx.gas_price, 1.into());
         assert_eq!(tx.nonce, 0);
@@ -416,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_1000000() -> Result<(), Error> {
+    fn decode_1000000() -> Result<(), DecodeError> {
         let txbytes = hex!(
             "
             f86e158512bfb19e608301f8dc94c083e9947cf02b8ffc7d3090ae9aea72df98fd
@@ -427,7 +444,7 @@ mod tests {
         );
 
         let tx = Tx::decode(&rlp::Rlp::new(&txbytes))?;
-        assert_eq!(tx.input, &[]);
+        assert_eq!(tx.input, &[] as &[u8]);
         assert_eq!(tx.gas_limit, 129244);
         assert_eq!(tx.gas_price, 80525500000u64.into());
         assert_eq!(tx.nonce, 21);

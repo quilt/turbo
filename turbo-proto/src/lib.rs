@@ -31,7 +31,6 @@ pub mod txpool {
 
 pub mod p2psentry {
     //! The gRPC interfaces related to the p2p sentry.
-    tonic::include_proto!("control");
     tonic::include_proto!("sentry");
 }
 

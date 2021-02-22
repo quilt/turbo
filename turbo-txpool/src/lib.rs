@@ -1,4 +1,4 @@
-// Copyright 2021 ConsenSys
+// Copyright 2020 ConsenSys
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,14 +27,17 @@ extern crate arbitrary_dep as arbitrary;
 
 use crate::config::Config;
 use crate::control::{Control, PbControl};
-use crate::error::Error;
+use crate::error::{import_error, ImportError};
 use crate::tx::{Tx, VerifiedTx};
 
 use ethereum_types::{Address, H256, U256};
 
 use slab::Slab;
 
-use std::collections::{hash_map, BTreeSet, HashMap};
+use snafu::{ensure, OptionExt, ResultExt};
+
+use std::cmp::Reverse;
+use std::collections::{hash_map, BTreeSet, BinaryHeap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -48,15 +51,22 @@ use tokio_stream::StreamExt;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use tracing::{debug, info};
+
 use turbo_proto::txpool::block_stream_request::StartWith;
 use turbo_proto::txpool::txpool_control_client as client;
 use turbo_proto::txpool::txpool_server as server;
 use turbo_proto::txpool::{
-    account_diff, block_diff, AccountDiff, AccountInfoRequest, AppliedBlock,
-    BlockDiff, BlockStreamRequest, GetTransactionsReply,
-    GetTransactionsRequest, ImportReply, ImportRequest, ImportResult,
-    RevertedBlock, TxHashes,
+    block_diff, AccountInfo, AccountInfoRequest, AppliedBlock, BlockDiff,
+    BlockStreamRequest, GetTransactionsReply, GetTransactionsRequest,
+    ImportReply, ImportRequest, ImportResult, RevertedBlock, TxHashes,
 };
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PooledTx {
+    tx: VerifiedTx,
+    runnable: bool,
+}
 
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
 struct Priced {
@@ -64,12 +74,20 @@ struct Priced {
     pub key: usize,
 }
 
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+struct Nonced {
+    pub nonce: u64,
+    pub key: usize,
+}
+
 #[derive(Debug)]
 struct Inner<C> {
     control: C,
-    txs: Slab<VerifiedTx>,
+    txs: Slab<PooledTx>,
     by_hash: HashMap<H256, usize>,
     by_price: BTreeSet<Priced>,
+
+    soon: HashMap<Address, BTreeSet<Nonced>>,
 
     latest_block: Option<H256>,
     max_txs: usize,
@@ -80,23 +98,57 @@ impl<C> Inner<C> {
         self.by_price.iter().next().map(|p| p.key)
     }
 
-    fn cheapest(&self) -> Option<&VerifiedTx> {
+    fn cheapest(&self) -> Option<&PooledTx> {
         self.cheapest_key().map(|k| &self.txs[k])
     }
 
-    fn by_hash(&self, hash: &H256) -> Option<&VerifiedTx> {
+    fn by_hash(&self, hash: &H256) -> Option<&PooledTx> {
         self.by_hash.get(hash).and_then(|k| self.txs.get(*k))
     }
 
-    fn remove(&mut self, key: usize) {
-        let tx = self.txs.remove(key);
-        self.by_hash.remove(tx.hash()).expect("desync by hash");
+    fn remove_soon(
+        soon: &mut HashMap<Address, BTreeSet<Nonced>>,
+        account: Address,
+        nonced: &Nonced,
+    ) -> bool {
+        let mut entry = match soon.entry(account) {
+            hash_map::Entry::Vacant(_) => return false,
+            hash_map::Entry::Occupied(o) => o,
+        };
 
-        let removed = self.by_price.remove(&Priced {
-            gas_price: *tx.gas_price(),
-            key,
-        });
-        assert!(removed, "desync by price");
+        if !entry.get_mut().remove(&nonced) {
+            return false;
+        }
+
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+
+        true
+    }
+
+    fn remove(&mut self, key: usize) -> PooledTx {
+        let ptx = self.txs.remove(key);
+        self.by_hash.remove(ptx.tx.hash()).expect("desync by hash");
+
+        if ptx.runnable {
+            let removed = self.by_price.remove(&Priced {
+                gas_price: *ptx.tx.gas_price(),
+                key,
+            });
+            assert!(removed, "desync by price");
+        } else {
+            let nonced = Nonced {
+                key,
+                nonce: ptx.tx.nonce(),
+            };
+
+            let removed =
+                Self::remove_soon(&mut self.soon, *ptx.tx.from(), &nonced);
+            assert!(removed, "desync in soon");
+        }
+
+        ptx
     }
 
     pub fn find_unknown_transactions(
@@ -120,6 +172,7 @@ impl<C> Inner<C> {
             txs: Slab::with_capacity(config.max_txs()),
             by_hash: HashMap::with_capacity(config.max_txs()),
             by_price: BTreeSet::new(),
+            soon: HashMap::with_capacity(config.max_txs()),
             control,
         }
     }
@@ -133,9 +186,9 @@ impl<C> Inner<C> {
             .hashes
             .into_iter()
             .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
-            .map(|verified| {
+            .map(|ptx| {
                 let mut stream = rlp::RlpStream::new();
-                verified.tx().encode(&mut stream);
+                ptx.tx.tx().encode(&mut stream);
                 stream.as_raw().to_vec()
             })
             .collect();
@@ -143,25 +196,158 @@ impl<C> Inner<C> {
         Ok(Response::new(GetTransactionsReply { txs }))
     }
 
-    fn insert(&mut self, verified: VerifiedTx) -> ImportResult {
-        let by_hash = match self.by_hash.entry(*verified.hash()) {
-            hash_map::Entry::Vacant(v) => v,
-            hash_map::Entry::Occupied(_) => return ImportResult::AlreadyExists,
-        };
-
-        let gas_price = *verified.gas_price();
-        let key = self.txs.insert(verified);
-
-        let inserted = self.by_price.insert(Priced { gas_price, key });
-        assert!(inserted);
-
-        by_hash.insert(key);
+    fn evict_soon(&mut self) {
+        // Build a min-heap from the highest nonce'd transactions in each
+        // account.
+        let mut heap: BinaryHeap<_> = self
+            .soon
+            .values()
+            .flat_map(|x| x.iter().next_back())
+            .map(|nonced| Priced {
+                gas_price: *self.txs[nonced.key].tx.gas_price(),
+                key: nonced.key,
+            })
+            .map(Reverse)
+            .collect();
 
         while self.txs.len() > self.max_txs {
-            self.remove(self.cheapest_key().unwrap());
+            // Get the cheapest "soon" transaction (or break)
+            let popped = match heap.pop() {
+                Some(p) => p,
+                None => break,
+            };
+
+            // Remove that transaction, but save its account.
+            let ptx = self.remove(popped.0.key);
+            let account = *ptx.tx.from();
+            debug!(
+                "Evicting soon tx from={} nonce={} price={} hash={}",
+                account,
+                ptx.tx.nonce(),
+                ptx.tx.gas_price(),
+                ptx.tx.hash(),
+            );
+
+            // Get transaction with the preceeding nonce from the same account.
+            let next_nonced =
+                self.soon.get(&account).and_then(|t| t.iter().next_back());
+            let next_nonced = match next_nonced {
+                Some(nn) => nn,
+                None => continue,
+            };
+
+            let next_priced = Priced {
+                key: next_nonced.key,
+                gas_price: *self.txs[next_nonced.key].tx.gas_price(),
+            };
+
+            // Add that preceeding transaction into the heap, and evict again!
+            heap.push(Reverse(next_priced));
+        }
+    }
+
+    fn log_insert(&mut self, pooled: PooledTx) -> Result<(), ImportError> {
+        let result = self.insert(pooled.clone());
+        match &result {
+            Err(e) => debug!(
+                "Rejected tx from={} nonce={} price={} hash={} reason={}",
+                pooled.tx.from(),
+                pooled.tx.nonce(),
+                pooled.tx.gas_price(),
+                pooled.tx.hash(),
+                e,
+            ),
+            Ok(_) => debug!(
+                "Inserted tx from={} nonce={} price={} hash={}",
+                pooled.tx.from(),
+                pooled.tx.nonce(),
+                pooled.tx.gas_price(),
+                pooled.tx.hash(),
+            ),
         }
 
-        ImportResult::Success
+        result
+    }
+
+    fn insert(&mut self, pooled: PooledTx) -> Result<(), ImportError> {
+        let by_hash = match self.by_hash.entry(*pooled.tx.hash()) {
+            hash_map::Entry::Vacant(v) => v,
+            hash_map::Entry::Occupied(_) => {
+                return Err(ImportError::AlreadyExists {
+                    tx_hash: *pooled.tx.hash(),
+                })
+            }
+        };
+
+        let key = self.txs.insert(pooled.clone());
+
+        if pooled.runnable {
+            let inserted = self.by_price.insert(Priced {
+                gas_price: *pooled.tx.gas_price(),
+                key,
+            });
+            assert!(inserted);
+            by_hash.insert(key);
+        } else {
+            let set = self.soon.entry(*pooled.tx.from()).or_default();
+
+            let contiguous_end = set
+                .iter()
+                .next_back()
+                .map(|nonced| (nonced.nonce + 1) == pooled.tx.nonce())
+                .unwrap_or(true);
+
+            let contiguous_start = set
+                .iter()
+                .next()
+                .map(|nonced| (nonced.nonce - 1) == pooled.tx.nonce())
+                .unwrap_or(true);
+
+            let contiguous = contiguous_start | contiguous_end;
+
+            // TODO: The above `contiguous` calculation is meant to prevent gaps
+            //       between the current account nonce, the runnable tx (if one
+            //       exists), and the set of "soon" txs.
+            //
+            //       Gaps between transactions make the eviction policy
+            //       extremely unfair.
+            //
+            //       The `contiguous` calculation, so far, only detects gaps in
+            //       the "soon" tx set, and not between the current nonce or
+            //       the next runnable tx, so the eviction is unfair.
+
+            ensure!(
+                contiguous,
+                import_error::NonceGap {
+                    from: *pooled.tx.from(),
+                    tx_hash: *pooled.tx.hash(),
+                    tx_nonce: pooled.tx.nonce(),
+                }
+            );
+
+            let inserted = set.insert(Nonced {
+                nonce: pooled.tx.nonce(),
+                key,
+            });
+            assert!(inserted);
+
+            by_hash.insert(key);
+        };
+
+        self.evict_soon();
+
+        while self.txs.len() > self.max_txs {
+            let ptx = self.remove(self.cheapest_key().unwrap());
+            debug!(
+                "Evicting cheapest tx from={} nonce={} price={} tx={}",
+                ptx.tx.from(),
+                ptx.tx.nonce(),
+                ptx.tx.gas_price(),
+                ptx.tx.hash(),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -169,51 +355,98 @@ impl<C> Inner<C>
 where
     C: Clone + Control,
 {
-    fn recheck(&mut self, diffs: &[AccountDiff]) {
+    fn recheck(&mut self, account_infos: &[AccountInfo]) {
         #[derive(Default)]
         struct Account {
             balance: U256,
             nonce: U256,
         }
 
-        let mut accounts = HashMap::with_capacity(diffs.len());
-        for diff in diffs {
-            let account;
-            let address;
-
-            match &diff.diff {
-                Some(account_diff::Diff::Deleted(addr)) => {
-                    account = Account::default();
-                    address = Address::from_slice(&addr);
-                }
-                Some(account_diff::Diff::Changed(delta)) => {
-                    address = Address::from_slice(&delta.address);
-                    account = Account {
-                        balance: U256::from_big_endian(&delta.balance),
-                        nonce: U256::from_big_endian(&delta.nonce),
-                    };
-                }
-                None => continue,
+        let mut accounts = HashMap::with_capacity(account_infos.len());
+        for account_info in account_infos {
+            let address = Address::from_slice(&account_info.address);
+            let account = Account {
+                balance: U256::from_big_endian(&account_info.balance),
+                nonce: U256::from_big_endian(&account_info.nonce),
             };
 
             accounts.insert(address, account);
         }
 
-        let mut to_remove = Vec::new();
-        for (key, tx) in self.txs.iter() {
-            let account = match accounts.get(tx.from()) {
+        let by_price = &mut self.by_price;
+        let soon = &mut self.soon;
+
+        self.txs.retain(|key, ptx| {
+            let account = match accounts.get(ptx.tx.from()) {
                 Some(a) => a,
-                None => continue,
+                None => return true,
             };
 
-            if Self::validate(tx, account.nonce, account.balance).is_err() {
-                to_remove.push(key);
-            }
-        }
+            let priced = Priced {
+                key,
+                gas_price: *ptx.tx.gas_price(),
+            };
 
-        for key in to_remove.into_iter() {
-            self.remove(key);
-        }
+            let nonced = Nonced {
+                key,
+                nonce: ptx.tx.nonce(),
+            };
+
+            match ptx.tx.is_runnable(account.nonce, account.balance) {
+                Ok(runnable) => {
+                    match (ptx.runnable, runnable) {
+                        (true, false) => {
+                            // Tx was runnable, now isn't.
+                            debug!(
+                                "Transaction unreadied from={} nonce={} price={} hash={}",
+                                ptx.tx.from(),
+                                ptx.tx.nonce(),
+                                ptx.tx.gas_price(),
+                                ptx.tx.hash(),
+                            );
+
+                            let removed = by_price.remove(&priced);
+                            assert!(removed);
+
+                            let inserted = soon.entry(*ptx.tx.from()).or_default().insert(nonced);
+                            assert!(inserted);
+                        },
+                        (false, true) => {
+                            // Tx was not runnable, now is.
+                            debug!(
+                                "Transaction readied from={} nonce={} price={} hash={}",
+                                ptx.tx.from(),
+                                ptx.tx.nonce(),
+                                ptx.tx.gas_price(),
+                                ptx.tx.hash(),
+                            );
+                            let removed = Self::remove_soon(soon, *ptx.tx.from(), &nonced);
+                            assert!(removed);
+
+                            let inserted = by_price.insert(priced);
+                            assert!(inserted);
+                        },
+                        _ => (),
+                    }
+
+                    true
+                }
+                Err(e) => {
+                    debug!(
+                        "Dropping tx from={} nonce={} price={} hash={} reason={}",
+                        ptx.tx.from(),
+                        ptx.tx.nonce(),
+                        ptx.tx.gas_price(),
+                        ptx.tx.hash(),
+                        e
+                    );
+
+                    by_price.remove(&priced);
+                    Self::remove_soon(soon, *ptx.tx.from(), &nonced);
+                    false
+                },
+            }
+        });
     }
 
     async fn block_reverted(&mut self, block: RevertedBlock) {
@@ -223,14 +456,19 @@ where
             txs: block.reverted_transactions,
         };
 
-        self.recheck(&block.new_state);
+        info!("block reverted latest_block={}", self.latest_block.unwrap(),);
+
+        self.recheck(&block.reverted_accounts);
         self.import_transactions_request(req).await.ok();
     }
 
     async fn block_applied(&mut self, block: AppliedBlock) {
         let hash = H256::from_slice(&block.hash);
+
         self.latest_block = Some(hash);
-        self.recheck(&block.account_diffs);
+        info!("block applied latest_block={}", self.latest_block.unwrap(),);
+
+        self.recheck(&block.changed_accounts);
     }
 
     async fn block_diff(&mut self, block_diff: BlockDiff) {
@@ -245,28 +483,34 @@ where
         }
     }
 
-    async fn qualify(&self, tx: Tx) -> Result<VerifiedTx, ImportResult> {
-        let latest_block = match self.latest_block {
-            Some(b) => b,
-            None => {
-                return Err(ImportResult::InternalError);
-            }
-        };
+    async fn log_qualify(&self, tx: Tx) -> Result<PooledTx, ImportError> {
+        let result = self.qualify(tx).await;
 
-        if self.txs.len() >= self.max_txs {
-            let cheapest =
-                self.cheapest().map(|t| *t.gas_price()).unwrap_or_default();
-            if tx.gas_price <= cheapest {
-                return Err(ImportResult::FeeTooLow);
-            }
+        if let Err(ref e) = result {
+            debug!("Disqualified transaction reason={}", e,);
         }
 
-        let verified = match VerifiedTx::new(tx) {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(ImportResult::Invalid);
-            }
-        };
+        result
+    }
+
+    async fn qualify(&self, tx: Tx) -> Result<PooledTx, ImportError> {
+        let latest_block = self.latest_block.context(import_error::NotReady)?;
+
+        if self.txs.len() >= self.max_txs {
+            let cheapest = self
+                .cheapest()
+                .map(|t| *t.tx.gas_price())
+                .unwrap_or_default();
+
+            ensure!(
+                tx.gas_price > cheapest,
+                import_error::FeeTooLow { minimum: cheapest },
+            );
+        }
+
+        let verified = VerifiedTx::new(tx)
+            .map_err(|e| Box::new(e).into())
+            .context(import_error::Ecdsa)?;
 
         let req = AccountInfoRequest {
             account: verified.from().as_bytes().to_owned(),
@@ -277,32 +521,19 @@ where
         let account = control
             .account_info(req)
             .await
-            .map_err(|_| ImportResult::InternalError)?;
+            .context(import_error::RequestFailed)?;
 
         let nonce = U256::from_big_endian(&account.nonce);
         let balance = U256::from_big_endian(&account.balance);
 
-        Self::validate(&verified, nonce, balance)?;
-        Ok(verified)
-    }
+        // TODO: Ensure the tx can actually fit in a block.
 
-    fn validate(
-        verified: &VerifiedTx,
-        nonce: U256,
-        balance: U256,
-    ) -> Result<(), ImportResult> {
-        if U256::from(verified.nonce()) != nonce {
-            return Err(ImportResult::Invalid);
-        }
+        let runnable = verified.is_runnable(nonce, balance)?;
 
-        let required =
-            (verified.gas_price() * verified.gas_limit()) + verified.value();
-
-        if balance < required {
-            return Err(ImportResult::Invalid);
-        }
-
-        Ok(())
+        Ok(PooledTx {
+            tx: verified,
+            runnable,
+        })
     }
 
     pub async fn insert_transactions(
@@ -310,15 +541,15 @@ where
         txs: Vec<Tx>,
     ) -> Vec<ImportResult> {
         let verified: Vec<_> = futures_util::future::join_all(
-            txs.into_iter().map(|tx| self.qualify(tx)),
+            txs.into_iter().map(|tx| self.log_qualify(tx)),
         )
         .await;
 
         let mut result = Vec::with_capacity(verified.len());
         for res in verified.into_iter() {
-            let ins = match res {
-                Ok(vx) => self.insert(vx),
-                Err(e) => e,
+            let ins = match res.and_then(|vx| self.log_insert(vx)) {
+                Ok(()) => ImportResult::Success,
+                Err(e) => e.into(),
             };
             result.push(ins);
         }
@@ -342,15 +573,7 @@ where
         let qualifiers = request.txs.into_iter().map(|b| {
             let decoded = Tx::decode(&rlp::Rlp::new(&b));
 
-            async {
-                match decoded {
-                    Ok(tx) => self.qualify(tx).await,
-                    Err(Error::RlpDecode { .. }) => Err(ImportResult::Invalid),
-                    Err(Error::IntegerOverflow) => {
-                        Err(ImportResult::InternalError)
-                    }
-                }
-            }
+            async { self.log_qualify(decoded?).await }
         });
 
         let txs = futures_util::future::join_all(qualifiers).await;
@@ -358,10 +581,11 @@ where
         let mut imported = Vec::with_capacity(txs.len());
 
         for tx in txs.into_iter() {
-            let result = match tx {
-                Ok(tx) => self.insert(tx),
-                Err(e) => e,
+            let result = match tx.and_then(|tx| self.log_insert(tx)) {
+                Ok(()) => ImportResult::Success,
+                Err(e) => e.into(),
             };
+
             imported.push(result as i32);
         }
 
@@ -546,11 +770,51 @@ impl server::Txpool for TxPool {
 mod tests {
     use crate::control::tests::TestControl;
 
+    use ethers_core::types::{NameOrAddress, TransactionRequest};
+
+    use ethers_signers::{LocalWallet, Signer};
+
     use std::convert::TryInto;
 
     use super::*;
 
     use turbo_proto::txpool::AccountInfo;
+
+    #[async_trait::async_trait]
+    trait Sign {
+        async fn sign_with(self, idx: usize) -> Tx;
+    }
+
+    #[async_trait::async_trait]
+    impl Sign for TransactionRequest {
+        async fn sign_with(self, idx: usize) -> Tx {
+            let sig = wallet(idx).sign_transaction(&self).await.unwrap();
+            let to = match self.to {
+                Some(NameOrAddress::Address(to)) => Some(to),
+                Some(NameOrAddress::Name(_)) => panic!("address only"),
+                None => None,
+            };
+
+            Tx {
+                to,
+                value: self.value.unwrap_or_default(),
+                gas_limit: self.gas.unwrap().as_u64(),
+                gas_price: self.gas_price.unwrap(),
+                input: self.data.map(|x| x.to_vec()).unwrap_or_default(),
+                nonce: self.nonce.unwrap().as_u64(),
+                v: sig.v,
+                r: sig.r,
+                s: sig.s,
+            }
+        }
+    }
+
+    const KEYS: &[&str] =
+        &["dcf2cbdd171a21c480aa7f53d77f31bb102282b3ff099c78e3118b37348c72f7"];
+
+    fn wallet(idx: usize) -> LocalWallet {
+        KEYS[idx].parse().unwrap()
+    }
 
     fn inner() -> Inner<TestControl> {
         let ctrl = TestControl::new();
@@ -558,6 +822,13 @@ mod tests {
         let mut out = Inner::with_config(ctrl, cfg);
         out.latest_block = Some(Default::default());
         out
+    }
+
+    fn ptx(gas_price: u64) -> PooledTx {
+        PooledTx {
+            runnable: true,
+            tx: vtx(gas_price),
+        }
     }
 
     fn vtx(gas_price: u64) -> VerifiedTx {
@@ -572,8 +843,8 @@ mod tests {
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: 1.into(),
-            s: 1.into(),
+            r: H256::from_low_u64_le(1),
+            s: H256::from_low_u64_le(1),
             value: Default::default(),
         }
         .into()
@@ -582,25 +853,26 @@ mod tests {
     #[test]
     fn cheapest() {
         let mut txs = Slab::new();
-        let k0 = txs.insert(vtx(100));
-        let k1 = txs.insert(vtx(101));
+        let k0 = txs.insert(ptx(100));
+        let k1 = txs.insert(ptx(101));
 
         let mut by_hash = HashMap::new();
-        by_hash.insert(*txs[k0].hash(), k0);
-        by_hash.insert(*txs[k1].hash(), k1);
+        by_hash.insert(*txs[k0].tx.hash(), k0);
+        by_hash.insert(*txs[k1].tx.hash(), k1);
 
         let mut by_price = BTreeSet::new();
         by_price.insert(Priced {
             key: k0,
-            gas_price: *txs[k0].gas_price(),
+            gas_price: *txs[k0].tx.gas_price(),
         });
         by_price.insert(Priced {
             key: k1,
-            gas_price: *txs[k1].gas_price(),
+            gas_price: *txs[k1].tx.gas_price(),
         });
 
         let inner = Inner {
             latest_block: Some(Default::default()),
+            soon: Default::default(),
             txs,
             by_hash,
             by_price,
@@ -619,28 +891,26 @@ mod tests {
         let tx1 = vtx(101);
 
         let q0 = inner.qualify(tx0.tx().clone()).await.unwrap();
-        let result = inner.insert(q0);
-        assert_eq!(result, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let q1 = inner.qualify(tx1.tx().clone()).await.unwrap();
-        let result2 = inner.insert(q1);
-        assert_eq!(result2, ImportResult::Success);
+        inner.insert(q1).unwrap();
 
         assert_eq!(inner.txs.len(), 2);
         assert_eq!(inner.by_hash.len(), 2);
         assert_eq!(inner.by_price.len(), 2);
 
-        assert_eq!(inner.txs[inner.by_hash[tx0.hash()]], tx0);
-        assert_eq!(inner.txs[inner.by_hash[tx1.hash()]], tx1);
+        assert_eq!(inner.txs[inner.by_hash[tx0.hash()]].tx, tx0);
+        assert_eq!(inner.txs[inner.by_hash[tx1.hash()]].tx, tx1);
 
         let mut iter = inner.by_price.iter();
         let i0 = iter.next().unwrap();
         let i1 = iter.next().unwrap();
 
-        assert_eq!(inner.txs[i0.key], tx0);
+        assert_eq!(inner.txs[i0.key].tx, tx0);
         assert_eq!(i0.gas_price, *tx0.gas_price());
 
-        assert_eq!(inner.txs[i1.key], tx1);
+        assert_eq!(inner.txs[i1.key].tx, tx1);
         assert_eq!(i1.gas_price, *tx1.gas_price());
     }
 
@@ -653,11 +923,10 @@ mod tests {
         inner.latest_block = Some(Default::default());
 
         let q0 = inner.qualify(tx(100)).await.unwrap();
-        let r0 = inner.insert(q0);
-        assert_eq!(r0, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let r1 = inner.qualify(tx(99)).await.unwrap_err();
-        assert_eq!(r1, ImportResult::FeeTooLow);
+        assert!(matches!(r1, ImportError::FeeTooLow { .. }));
     }
 
     #[tokio::test]
@@ -665,12 +934,11 @@ mod tests {
         let mut inner = inner();
 
         let q0 = inner.qualify(tx(100)).await.unwrap();
-        let r0 = inner.insert(q0);
-        assert_eq!(r0, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let q1 = inner.qualify(tx(100)).await.unwrap();
-        let r1 = inner.insert(q1);
-        assert_eq!(r1, ImportResult::AlreadyExists);
+        let r1 = inner.insert(q1).unwrap_err();
+        assert!(matches!(r1, ImportError::AlreadyExists { .. }));
     }
 
     #[tokio::test]
@@ -683,24 +951,22 @@ mod tests {
 
         let tx0 = tx(99);
         let q0 = inner.qualify(tx0).await.unwrap();
-        let r0 = inner.insert(q0);
-        assert_eq!(r0, ImportResult::Success);
+        inner.insert(q0).unwrap();
 
         let tx1 = vtx(100);
         let q1 = inner.qualify(tx1.tx().clone()).await.unwrap();
-        let r1 = inner.insert(q1);
-        assert_eq!(r1, ImportResult::Success);
+        inner.insert(q1).unwrap();
 
         assert_eq!(inner.txs.len(), 1);
         assert_eq!(inner.by_hash.len(), 1);
         assert_eq!(inner.by_price.len(), 1);
 
-        assert_eq!(inner.txs[inner.by_hash[tx1.hash()]], tx1);
+        assert_eq!(inner.txs[inner.by_hash[tx1.hash()]].tx, tx1);
 
         let mut iter = inner.by_price.iter();
         let i0 = iter.next().unwrap();
 
-        assert_eq!(inner.txs[i0.key], tx1);
+        assert_eq!(inner.txs[i0.key].tx, tx1);
         assert_eq!(i0.gas_price, *tx1.gas_price());
     }
 
@@ -719,13 +985,14 @@ mod tests {
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: 1.into(),
-            s: 1.into(),
+            r: H256::from_low_u64_le(1),
+            s: H256::from_low_u64_le(1),
             value: Default::default(),
         };
 
-        let q0 = inner.qualify(tx0).await.unwrap_err();
-        assert_eq!(q0, ImportResult::Invalid);
+        let q0 = inner.qualify(tx0.clone()).await.unwrap();
+        assert_eq!(q0.tx.tx(), &tx0);
+        assert_eq!(q0.runnable, false);
     }
 
     #[tokio::test]
@@ -743,13 +1010,13 @@ mod tests {
             to: Default::default(),
             input: Default::default(),
             v: Default::default(),
-            r: 1.into(),
-            s: 1.into(),
+            r: H256::from_low_u64_le(1),
+            s: H256::from_low_u64_le(1),
             value: 0xFFFFFFFFFFFFFFFFFu128.into(),
         };
 
         let q0 = inner.qualify(tx0).await.unwrap_err();
-        assert_eq!(q0, ImportResult::Invalid);
+        assert!(matches!(q0, ImportError::InsufficientBalance { .. }));
     }
 
     #[tokio::test]
@@ -776,14 +1043,10 @@ mod tests {
             nonce: nonce.to_vec(),
         };
 
-        let account_diff = AccountDiff {
-            diff: Some(account_diff::Diff::Changed(account)),
-        };
-
         let applied = AppliedBlock {
             hash: vec![0u8; 32],
             parent_hash: vec![1u8; 32],
-            account_diffs: vec![account_diff],
+            changed_accounts: vec![account],
         };
 
         let diff = BlockDiff {
@@ -819,14 +1082,10 @@ mod tests {
             nonce: nonce.to_vec(),
         };
 
-        let account_diff = AccountDiff {
-            diff: Some(account_diff::Diff::Changed(account)),
-        };
-
         let applied = AppliedBlock {
             hash: vec![0u8; 32],
             parent_hash: vec![1u8; 32],
-            account_diffs: vec![account_diff],
+            changed_accounts: vec![account],
         };
 
         let diff = BlockDiff {
@@ -836,5 +1095,148 @@ mod tests {
         inner.block_diff(diff).await;
 
         assert_eq!(inner.txs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_soon_tx() {
+        let mut inner = Inner::with_config(
+            TestControl::new(),
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let mut tx0 = tx(100);
+        tx0.nonce = 1;
+        let vtx0 = VerifiedTx::new(tx0.clone()).unwrap();
+
+        let inserted = inner.insert_transactions(vec![tx0]).await;
+        assert_eq!(inserted, [ImportResult::Success]);
+
+        assert_eq!(inner.txs.len(), 1);
+        assert!(matches!(
+            inner.txs[0],
+            PooledTx {
+                runnable: false,
+                ..
+            }
+        ));
+
+        let soon = &inner.soon[vtx0.from()];
+        assert_eq!(soon.len(), 1);
+
+        let nonced = soon.iter().next().unwrap();
+        assert_eq!(nonced.nonce, 1);
+    }
+
+    #[tokio::test]
+    async fn reject_soon_tx() {
+        let mut inner = Inner::with_config(
+            TestControl::new(),
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let mut tx0 = tx(100);
+        tx0.nonce = 1;
+
+        inner.insert_transactions(vec![tx(1), tx0]).await;
+
+        assert_eq!(inner.txs.len(), 1);
+        assert_eq!(inner.txs[0].runnable, true);
+        assert_eq!(inner.txs[0].tx.gas_price(), &1.into());
+
+        assert_eq!(inner.soon.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn evict_soon_tx_with_runnable() {
+        let mut inner = Inner::with_config(
+            TestControl::new(),
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let mut tx0 = tx(100);
+        tx0.nonce = 1;
+
+        inner.insert_transactions(vec![tx0, tx(1)]).await;
+
+        assert_eq!(inner.txs.len(), 1);
+        assert_eq!(inner.txs[1].runnable, true);
+        assert_eq!(inner.txs[1].tx.gas_price(), &1.into());
+
+        assert!(inner.soon.is_empty());
+        assert_eq!(inner.by_price.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn evict_soon_tx_with_soon_different_account() {
+        let mut inner = Inner::with_config(
+            TestControl::new(),
+            Config::builder().control("").max_txs(1).build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let mut tx0 = tx(100);
+        tx0.nonce = 1;
+
+        let mut tx1 = tx(101);
+        tx1.nonce = 1;
+
+        inner.insert_transactions(vec![tx0, tx1.clone()]).await;
+
+        assert_eq!(inner.txs.len(), 1);
+        assert_eq!(inner.txs[1].runnable, false);
+        assert_eq!(inner.txs[1].tx.tx(), &tx1);
+
+        assert_eq!(inner.soon.len(), 1);
+        assert!(inner.by_price.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insert_two_from_same_account() {
+        let mut inner = Inner::with_config(
+            TestControl::new(),
+            Config::builder().control("").build(),
+        );
+        inner.latest_block = Some(Default::default());
+
+        let tx0 = TransactionRequest::new()
+            .to(Address::default())
+            .nonce(0)
+            .value(1)
+            .gas(21000)
+            .gas_price(1)
+            .sign_with(0)
+            .await;
+
+        let tx1 = TransactionRequest::new()
+            .to(Address::default())
+            .nonce(1)
+            .value(1)
+            .gas(21000)
+            .gas_price(100)
+            .sign_with(0)
+            .await;
+
+        let res = inner
+            .insert_transactions(vec![tx1.clone(), tx0.clone()])
+            .await;
+        assert_eq!(res, [ImportResult::Success, ImportResult::Success]);
+
+        assert_eq!(inner.txs.len(), 2);
+        assert_eq!(inner.txs[0].runnable, false);
+        assert_eq!(inner.txs[0].tx.tx(), &tx1);
+        assert_eq!(inner.txs[1].runnable, true);
+        assert_eq!(inner.txs[1].tx.tx(), &tx0);
+
+        assert_eq!(inner.soon.len(), 1);
+        let soon_set = &inner.soon[&wallet(0).address()];
+        assert_eq!(soon_set.len(), 1);
+        let soon = soon_set.iter().next().unwrap();
+        assert_eq!(soon.key, 0);
+        assert_eq!(soon.nonce, 1);
+
+        assert_eq!(inner.by_price.len(), 1);
     }
 }
