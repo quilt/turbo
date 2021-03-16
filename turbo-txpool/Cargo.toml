@@ -11,11 +11,11 @@ license = "Apache-2.0"
 arbitrary = ["arbitrary-dep", "ethereum-types/arbitrary"]
 
 [dependencies]
-turbo-proto = { path = "../turbo-proto" }
+ethereum-interfaces = { git = "https://github.com/rust-ethereum/interfaces" }
 tokio = { version = "1.1.0", features = [ "sync", "macros", "rt-multi-thread" ] }
 tokio-stream = "0.1.0"
 tonic = { version = "0.4.0", features = ["transport"] }
-ethereum-types = "0.10.0"
+ethereum-types = "0.11.0"
 slab = "0.4.2"
 rlp = "0.5.0"
 snafu = "0.6.9"
@@ -40,5 +40,5 @@ features = [ "derive" ]
 
 [dev-dependencies]
 hex-literal = "0.3.1"
-ethers-core = "0.2.0"
-ethers-signers = "0.2.0"
+ethers-core = "0.2.2"
+ethers-signers = "0.2.2"

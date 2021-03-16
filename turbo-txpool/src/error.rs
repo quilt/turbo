@@ -17,7 +17,7 @@
 pub(crate) mod decode_error {
     use snafu::{ResultExt, Snafu};
 
-    use turbo_proto::txpool::ImportResult;
+    use ethereum_interfaces::txpool::ImportResult;
 
     /// Errors possible while decoding transactions.
     #[derive(Debug, Snafu)]
@@ -64,7 +64,7 @@ pub(crate) mod import_error {
 
     use snafu::Snafu;
 
-    use turbo_proto::txpool::ImportResult;
+    use ethereum_interfaces::txpool::ImportResult;
 
     /// Errors that can occur while importing transactions into the pool.
     #[derive(Debug, Snafu)]
@@ -135,6 +135,9 @@ pub(crate) mod import_error {
             /// The preceding cause of this error.
             source: tonic::Status,
         },
+
+        /// A protobuf message is missing required fields.
+        IncompleteMessage,
     }
 
     impl From<ImportError> for ImportResult {
@@ -146,6 +149,7 @@ pub(crate) mod import_error {
                 ImportError::NotReady => ImportResult::InternalError,
                 ImportError::Ecdsa { .. } => ImportResult::Invalid,
                 ImportError::Decode { .. } => ImportResult::Invalid,
+                ImportError::IncompleteMessage => ImportResult::Invalid,
                 ImportError::AlreadyExists { .. } => {
                     ImportResult::AlreadyExists
                 }
