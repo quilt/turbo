@@ -3,7 +3,7 @@ os:
     - windows
 language: rust
 rust:
-    - 1.46.0
+    - 1.50.0
     - stable
     - nightly
 dist: bionic
