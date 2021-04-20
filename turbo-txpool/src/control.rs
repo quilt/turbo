@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use tonic::{Status, Streaming};
 
-use turbo_proto::txpool::txpool_control_client::TxpoolControlClient;
-use turbo_proto::txpool::{
+use ethereum_interfaces::txpool::txpool_control_client::TxpoolControlClient;
+use ethereum_interfaces::txpool::{
     AccountInfoReply, AccountInfoRequest, BlockDiff, BlockStreamRequest,
 };
 
@@ -77,6 +77,8 @@ impl PbControl {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use ethereum_types::U256;
+
     use hex_literal::hex;
 
     use super::*;
@@ -132,9 +134,10 @@ pub(crate) mod tests {
             &mut self,
             _request: AccountInfoRequest,
         ) -> Result<AccountInfoReply, Status> {
+            let balance = U256::from(&Self::BALANCE);
             Ok(AccountInfoReply {
                 nonce: Default::default(),
-                balance: Self::BALANCE.into(),
+                balance: Some(balance.into()),
             })
         }
     }

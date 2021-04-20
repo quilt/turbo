@@ -53,10 +53,10 @@ use tonic::{Request, Response, Status};
 
 use tracing::{debug, info};
 
-use turbo_proto::txpool::block_stream_request::StartWith;
-use turbo_proto::txpool::txpool_control_client as client;
-use turbo_proto::txpool::txpool_server as server;
-use turbo_proto::txpool::{
+use ethereum_interfaces::txpool::block_stream_request::StartWith;
+use ethereum_interfaces::txpool::txpool_control_client as client;
+use ethereum_interfaces::txpool::txpool_server as server;
+use ethereum_interfaces::txpool::{
     block_diff, AccountInfo, AccountInfoRequest, AppliedBlock, BlockDiff,
     BlockStreamRequest, GetTransactionsReply, GetTransactionsRequest,
     ImportReply, ImportRequest, ImportResult, RevertedBlock, TxHashes,
@@ -159,7 +159,7 @@ impl<C> Inner<C> {
             .into_inner()
             .hashes
             .into_iter()
-            .filter(|vec| !self.by_hash.contains_key(&H256::from_slice(&vec)))
+            .filter(|vec| !self.by_hash.contains_key(&H256::from(vec.clone())))
             .collect();
 
         Ok(Response::new(TxHashes { hashes }))
@@ -185,11 +185,11 @@ impl<C> Inner<C> {
             .into_inner()
             .hashes
             .into_iter()
-            .filter_map(|vec| self.by_hash(&H256::from_slice(&vec)))
+            .filter_map(|vec| self.by_hash(&H256::from(vec)))
             .map(|ptx| {
                 let mut stream = rlp::RlpStream::new();
                 ptx.tx.tx().encode(&mut stream);
-                stream.as_raw().to_vec()
+                stream.as_raw().to_vec().into()
             })
             .collect();
 
@@ -364,10 +364,19 @@ where
 
         let mut accounts = HashMap::with_capacity(account_infos.len());
         for account_info in account_infos {
-            let address = Address::from_slice(&account_info.address);
+            let address = match account_info.address.clone() {
+                Some(a) => Address::from(a),
+                None => continue,
+            };
+
+            let balance = match account_info.balance.clone() {
+                Some(b) => U256::from(b),
+                None => continue,
+            };
+
             let account = Account {
-                balance: U256::from_big_endian(&account_info.balance),
-                nonce: U256::from_big_endian(&account_info.nonce),
+                balance,
+                nonce: U256::from(account_info.nonce),
             };
 
             accounts.insert(address, account);
@@ -450,7 +459,10 @@ where
     }
 
     async fn block_reverted(&mut self, block: RevertedBlock) {
-        self.latest_block = Some(H256::from_slice(&block.new_hash));
+        self.latest_block = match block.new_hash {
+            Some(new_hash) => Some(H256::from(new_hash)),
+            None => return,
+        };
 
         let req = ImportRequest {
             txs: block.reverted_transactions,
@@ -463,7 +475,10 @@ where
     }
 
     async fn block_applied(&mut self, block: AppliedBlock) {
-        let hash = H256::from_slice(&block.hash);
+        let hash = match block.hash {
+            Some(hash) => H256::from(hash),
+            None => return,
+        };
 
         self.latest_block = Some(hash);
         info!("block applied latest_block={}", self.latest_block.unwrap(),);
@@ -513,8 +528,8 @@ where
             .context(import_error::Ecdsa)?;
 
         let req = AccountInfoRequest {
-            account: verified.from().as_bytes().to_owned(),
-            block_hash: Vec::from(latest_block.to_fixed_bytes()),
+            account: Some((*verified.from()).into()),
+            block_hash: Some(latest_block.into()),
         };
 
         let mut control = self.control.clone();
@@ -523,8 +538,10 @@ where
             .await
             .context(import_error::RequestFailed)?;
 
-        let nonce = U256::from_big_endian(&account.nonce);
-        let balance = U256::from_big_endian(&account.balance);
+        let nonce = U256::from(account.nonce);
+        let balance = U256::from(
+            account.balance.context(import_error::IncompleteMessage)?,
+        );
 
         // TODO: Ensure the tx can actually fit in a block.
 
@@ -778,7 +795,7 @@ mod tests {
 
     use super::*;
 
-    use turbo_proto::txpool::AccountInfo;
+    use ethereum_interfaces::txpool::AccountInfo;
 
     #[async_trait::async_trait]
     trait Sign {
@@ -1034,18 +1051,15 @@ mod tests {
         assert_eq!(inserted, &[ImportResult::Success]);
         assert_eq!(inner.txs.len(), 1);
 
-        let mut nonce = [0u8; 32];
-        U256::one().to_big_endian(&mut nonce);
-
         let account = AccountInfo {
-            address: tx0.from().as_bytes().to_vec(),
-            balance: TestControl::BALANCE.to_vec(),
-            nonce: nonce.to_vec(),
+            address: Some(tx0.from().clone().into()),
+            balance: Some(U256::from(&TestControl::BALANCE).into()),
+            nonce: 1,
         };
 
         let applied = AppliedBlock {
-            hash: vec![0u8; 32],
-            parent_hash: vec![1u8; 32],
+            hash: Some(H256::from([0u8; 32]).into()),
+            parent_hash: Some(H256::from([1u8; 32]).into()),
             changed_accounts: vec![account],
         };
 
@@ -1073,18 +1087,15 @@ mod tests {
         assert_eq!(inserted, &[ImportResult::Success]);
         assert_eq!(inner.txs.len(), 1);
 
-        let mut nonce = [0u8; 32];
-        U256::one().to_big_endian(&mut nonce);
-
         let account = AccountInfo {
-            address: vec![0u8; 20],
-            balance: TestControl::BALANCE.to_vec(),
-            nonce: nonce.to_vec(),
+            address: Some(Address::from([0u8; 20]).into()),
+            balance: Some(U256::from(&TestControl::BALANCE).into()),
+            nonce: 1,
         };
 
         let applied = AppliedBlock {
-            hash: vec![0u8; 32],
-            parent_hash: vec![1u8; 32],
+            hash: Some(H256::from([0u8; 32]).into()),
+            parent_hash: Some(H256::from([1u8; 32]).into()),
             changed_accounts: vec![account],
         };
 

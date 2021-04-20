@@ -1,2 +1,2 @@
 [workspace]
-members = ["turbo-proto", "turbo-txpool", "turbo-cli"]
+members = ["turbo-txpool", "turbo-cli"]

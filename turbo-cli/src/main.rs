@@ -26,11 +26,13 @@ use structopt::StructOpt;
 use tonic::transport::channel::Channel;
 use tonic::transport::Uri;
 
-use turbo_proto::txpool::txpool_client::TxpoolClient;
-use turbo_proto::txpool::txpool_control_client::TxpoolControlClient;
-use turbo_proto::txpool::{
+use ethereum_interfaces::txpool::txpool_client::TxpoolClient;
+use ethereum_interfaces::txpool::txpool_control_client::TxpoolControlClient;
+use ethereum_interfaces::txpool::{
     AccountInfoRequest, GetTransactionsRequest, ImportRequest, TxHashes,
 };
+
+use ethereum_types::{Address, H256};
 
 mod cmd {
     use super::*;
@@ -80,8 +82,8 @@ mod cmd {
         ) -> Result<(), Box<dyn std::error::Error>> {
             let resp = client
                 .account_info(AccountInfoRequest {
-                    block_hash: Vec::from(&self.block_hash as &[u8]),
-                    account: Vec::from(&self.account as &[u8]),
+                    block_hash: Some(H256::from(&self.block_hash).into()),
+                    account: Some(Address::from(&self.account).into()),
                 })
                 .await?;
 
@@ -120,8 +122,12 @@ mod cmd {
             self,
             dst: Uri,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let hashes: Vec<_> =
-                self.hashes.into_iter().map(Vec::from).collect();
+            let hashes: Vec<_> = self
+                .hashes
+                .into_iter()
+                .map(H256::from)
+                .map(Into::into)
+                .collect();
 
             let mut client = TxpoolClient::connect(dst).await?;
             let txs = client
@@ -145,8 +151,12 @@ mod cmd {
             self,
             dst: Uri,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let hashes: Vec<_> =
-                self.hashes.into_iter().map(Vec::from).collect();
+            let hashes: Vec<_> = self
+                .hashes
+                .into_iter()
+                .map(H256::from)
+                .map(Into::into)
+                .collect();
 
             let mut client = TxpoolClient::connect(dst).await?;
             let txs = client
@@ -170,10 +180,9 @@ mod cmd {
             self,
             dst: Uri,
         ) -> Result<(), Box<dyn std::error::Error>> {
+            let txs: Vec<_> = self.txs.into_iter().map(Into::into).collect();
             let mut client = TxpoolClient::connect(dst).await?;
-            let txs = client
-                .import_transactions(ImportRequest { txs: self.txs })
-                .await?;
+            let txs = client.import_transactions(ImportRequest { txs }).await?;
 
             println!("{:?}", txs);
 
